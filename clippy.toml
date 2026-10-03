@@ -1,0 +1,13 @@
+# tests may crash on purpose
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true
+
+cognitive-complexity-threshold = 15
+excessive-nesting-threshold = 4
+too-many-arguments-threshold = 6
+
+# nothing is published, so lints may suggest signature changes
+avoid-breaking-exported-api = false

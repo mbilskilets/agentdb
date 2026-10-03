@@ -1,0 +1,260 @@
+use thiserror::Error;
+
+pub type Result<T> = std::result::Result<T, DbError>;
+
+/// Every message names what was wrong and what a correct call looks like,
+/// because the reader is an agent that will retry from the message alone.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum DbError {
+    #[error("unknown table `{table}`.{} Existing tables: {}.", hint(.suggestion.as_deref()), list(.available))]
+    UnknownTable {
+        table: String,
+        suggestion: Option<String>,
+        available: Vec<String>,
+    },
+
+    #[error("unknown field `{field}` on table `{table}`.{} Valid fields: {}.", hint(.suggestion.as_deref()), list(.available))]
+    UnknownField {
+        table: String,
+        field: String,
+        suggestion: Option<String>,
+        available: Vec<String>,
+    },
+
+    #[error("field `{field}` on table `{table}` expects {expected}, got {got}.")]
+    WrongType {
+        table: String,
+        field: String,
+        expected: String,
+        got: String,
+    },
+
+    #[error("table `{table}` requires these fields and they are missing: {}.", list(.fields))]
+    MissingRequired { table: String, fields: Vec<String> },
+
+    #[error("a document must be a JSON object like {{\"name\": \"Acme\"}}, got {got}.")]
+    NotAnObject { got: String },
+
+    #[error("`{field}` is set by the database. Remove it from the document.")]
+    ReservedField { field: String },
+
+    #[error(
+        "field `{field}` points to `{target}` id {id}, which does not exist. Insert that `{target}` document first or use an existing id."
+    )]
+    BrokenReference {
+        field: String,
+        target: String,
+        id: i64,
+    },
+
+    #[error("no document with id {id} in table `{table}`.")]
+    NotFound { table: String, id: i64 },
+
+    #[error(
+        "`{table}` id {id} is at version {actual}, but the update expected version {expected}. Someone else changed it: read it again with get() and retry with version {actual}."
+    )]
+    VersionConflict {
+        table: String,
+        id: i64,
+        expected: i64,
+        actual: i64,
+    },
+
+    #[error(
+        "cannot delete `{table}` id {id}: {count} document(s) in `{by_table}` point to it through `{by_field}`. Update or delete those first."
+    )]
+    StillReferenced {
+        table: String,
+        id: i64,
+        by_table: String,
+        by_field: String,
+        count: i64,
+    },
+
+    #[error("table `{table}` already exists. Use add_field() to extend it.")]
+    TableExists { table: String },
+
+    #[error("field `{field}` already exists on table `{table}`.")]
+    FieldExists { table: String, field: String },
+
+    #[error(
+        "cannot add required field `{field}` to `{table}`: it already holds {count} document(s) that would lack it. Add the field as optional."
+    )]
+    RequiredFieldOnExistingDocs {
+        table: String,
+        field: String,
+        count: i64,
+    },
+
+    #[error(
+        "invalid name `{name}`. Names start with a lowercase letter and use only lowercase letters, digits and underscores (max 64 characters)."
+    )]
+    InvalidName { name: String },
+
+    #[error("enum field `{field}` needs at least one allowed value.")]
+    EmptyEnum { field: String },
+
+    #[error("operator `{op}` does not work on field `{field}` ({field_type}). Operators for this field: {}.", list(.allowed))]
+    InvalidOperator {
+        field: String,
+        op: String,
+        field_type: String,
+        allowed: Vec<String>,
+    },
+
+    #[error(
+        "this would permanently delete {what}, affecting {count} document(s). Call again with force = true if that is intended."
+    )]
+    WouldDestroy { what: String, count: i64 },
+
+    #[error(
+        "cannot drop table `{table}`: field `{by_field}` on table `{by_table}` links to it. Remove that field first."
+    )]
+    TableReferenced {
+        table: String,
+        by_table: String,
+        by_field: String,
+    },
+
+    #[error(
+        "cannot make `{field}` required on `{table}`: {count} document(s) have no value for it. Fill them in first; find them by filtering `{field}` eq null."
+    )]
+    MissingValues {
+        table: String,
+        field: String,
+        count: i64,
+    },
+
+    #[error("field `{field}` on `{table}` is not an enum, so it has no list of allowed values.")]
+    NotAnEnum { table: String, field: String },
+
+    #[error("`{value}` is already an allowed value of `{field}` on `{table}`.")]
+    EnumValueExists {
+        table: String,
+        field: String,
+        value: String,
+    },
+
+    #[error(
+        "this database file uses storage format {found}, but this version of agentdb only understands up to {supported}. Upgrade agentdb."
+    )]
+    NewerFormat { found: i64, supported: i64 },
+
+    #[error(
+        "cannot change `{field}` on `{table}` to {to}: {count} document(s) hold a value that does not fit, for example id {example_id} with {example}. Fix those values first; nothing was changed."
+    )]
+    CannotConvert {
+        table: String,
+        field: String,
+        to: String,
+        count: usize,
+        example_id: i64,
+        example: String,
+    },
+
+    #[error(
+        "cannot remove `{value}` from `{field}` on `{table}`: {count} document(s) still use it. Update them to another value first."
+    )]
+    EnumValueInUse {
+        table: String,
+        field: String,
+        value: String,
+        count: i64,
+    },
+
+    #[error("`{value}` is not an allowed value of `{field}` on `{table}`. Allowed values: {}.", list(.allowed))]
+    EnumValueMissing {
+        table: String,
+        field: String,
+        value: String,
+        allowed: Vec<String>,
+    },
+
+    #[error("step {step} of {of} failed, so none of the {of} changes were applied: {source}")]
+    StepFailed {
+        step: usize,
+        of: usize,
+        source: Box<Self>,
+    },
+
+    #[error("the encryption key must not be empty.")]
+    EmptyKey,
+
+    #[error(
+        "could not open the database: the encryption key is wrong, or the file is not an agentdb database."
+    )]
+    WrongKey,
+
+    #[error("`{got}` is not a timestamp ({reason}). Use RFC 3339, like 2026-10-03T14:30:00Z.")]
+    InvalidTimestamp { got: String, reason: String },
+
+    #[error(
+        "the TYPESAFE_API_KEY environment variable is not set, so ask() cannot reach the model. find() works without it."
+    )]
+    MissingApiKey,
+
+    #[error("the language model request failed: {0}. find() works without the model.")]
+    Jev(String),
+
+    #[error("storage error: {0}")]
+    Storage(#[from] rusqlite::Error),
+
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+impl DbError {
+    /// A short, stable name for the kind of error, for code that needs to
+    /// branch on it. The message is for the agent; this is for the program.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownTable { .. } => "unknown_table",
+            Self::UnknownField { .. } => "unknown_field",
+            Self::WrongType { .. } => "wrong_type",
+            Self::MissingRequired { .. } => "missing_required",
+            Self::NotAnObject { .. } => "not_an_object",
+            Self::ReservedField { .. } => "reserved_field",
+            Self::BrokenReference { .. } => "broken_reference",
+            Self::NotFound { .. } => "not_found",
+            Self::VersionConflict { .. } => "version_conflict",
+            Self::StillReferenced { .. } => "still_referenced",
+            Self::TableExists { .. } => "table_exists",
+            Self::FieldExists { .. } => "field_exists",
+            Self::RequiredFieldOnExistingDocs { .. } => "required_field_on_existing_docs",
+            Self::InvalidName { .. } => "invalid_name",
+            Self::EmptyEnum { .. } => "empty_enum",
+            Self::InvalidOperator { .. } => "invalid_operator",
+            Self::WouldDestroy { .. } => "would_destroy",
+            Self::TableReferenced { .. } => "table_referenced",
+            Self::MissingValues { .. } => "missing_values",
+            Self::NotAnEnum { .. } => "not_an_enum",
+            Self::EnumValueExists { .. } => "enum_value_exists",
+            Self::NewerFormat { .. } => "newer_format",
+            Self::CannotConvert { .. } => "cannot_convert",
+            Self::EnumValueInUse { .. } => "enum_value_in_use",
+            Self::EnumValueMissing { .. } => "enum_value_missing",
+            Self::EmptyKey => "empty_key",
+            Self::WrongKey => "wrong_key",
+            Self::InvalidTimestamp { .. } => "invalid_timestamp",
+            Self::MissingApiKey => "missing_api_key",
+            Self::StepFailed { source, .. } => source.code(),
+            Self::Jev(_) => "model_unavailable",
+            Self::Storage(_) => "storage",
+            Self::Internal(_) => "internal",
+        }
+    }
+}
+
+fn hint(suggestion: Option<&str>) -> String {
+    suggestion.map_or_else(String::new, |name| format!(" Did you mean `{name}`?"))
+}
+
+fn list(items: &[String]) -> String {
+    if items.is_empty() {
+        "(none)".to_owned()
+    } else {
+        items.join(", ")
+    }
+}

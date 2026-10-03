@@ -1,0 +1,647 @@
+//! Changes to the shape of the database: new tables, and changes to tables
+//! that already hold documents. The schema and the stored documents change
+//! together in one transaction, or not at all. Changes that would delete
+//! data refuse unless `force` is set.
+
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Number, Value};
+
+use crate::change::ChangeKind;
+use crate::db::{
+    AgentDb, all_defs, check_ref_target, count_docs, doc_exists, from_json, load_def, record,
+    to_json,
+};
+use crate::error::{DbError, Result};
+use crate::schema::{Field, FieldType, TableDef, check_name, validate_field};
+
+/// One change to the schema. Pass several to [`AgentDb::migrate`] to apply
+/// them as a unit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SchemaChange {
+    DefineTable {
+        table: TableDef,
+    },
+    AddField {
+        table: String,
+        field: Field,
+    },
+    RenameTable {
+        table: String,
+        new_name: String,
+    },
+    RenameField {
+        table: String,
+        field: String,
+        new_name: String,
+    },
+    /// Converts every stored value to the new type, or changes nothing if
+    /// any value does not fit.
+    ChangeType {
+        table: String,
+        field: String,
+        to: FieldType,
+    },
+    SetRequired {
+        table: String,
+        field: String,
+        required: bool,
+    },
+    AddEnumValue {
+        table: String,
+        field: String,
+        value: String,
+    },
+    RemoveEnumValue {
+        table: String,
+        field: String,
+        value: String,
+    },
+    /// Sets the description of a table, or of one of its fields. An empty
+    /// description clears it.
+    Describe {
+        table: String,
+        #[serde(default)]
+        field: Option<String>,
+        description: String,
+    },
+    RemoveField {
+        table: String,
+        field: String,
+        #[serde(default)]
+        force: bool,
+    },
+    DropTable {
+        table: String,
+        #[serde(default)]
+        force: bool,
+    },
+}
+
+impl AgentDb {
+    /// Applies schema changes in order as one unit: if any step fails, none
+    /// of them take effect.
+    ///
+    /// # Errors
+    /// The failing step's error. With more than one change it is wrapped in
+    /// [`DbError::StepFailed`], which says which step it was.
+    pub fn migrate(&self, changes: &[SchemaChange]) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let at = self.timestamp()?;
+        let mut events = Vec::new();
+        for (index, change) in changes.iter().enumerate() {
+            let table = apply(&tx, change)
+                .map_err(|source| step_error(index + 1, changes.len(), source))?;
+            events.push(record(&tx, ChangeKind::Schema, &table, at.clone(), None)?);
+        }
+        tx.commit()?;
+        for event in &events {
+            self.publish(event);
+        }
+        Ok(())
+    }
+
+    /// Creates a table.
+    ///
+    /// # Errors
+    /// Fails when the table exists, a name is invalid, or a reference field
+    /// points to a table that does not exist.
+    pub fn define_table(&self, def: &TableDef) -> Result<()> {
+        self.migrate(&[SchemaChange::DefineTable { table: def.clone() }])
+    }
+
+    /// Adds a field to an existing table.
+    ///
+    /// # Errors
+    /// Fails when the field exists, or when it is required and the table
+    /// already holds documents.
+    pub fn add_field(&self, table: &str, field: Field) -> Result<()> {
+        self.migrate(&[SchemaChange::AddField {
+            table: table.to_owned(),
+            field,
+        }])
+    }
+
+    /// Renames a table. Fields in other tables that link to it follow.
+    ///
+    /// # Errors
+    /// Fails when the new name is invalid or already taken.
+    pub fn rename_table(&self, table: &str, new_name: &str) -> Result<()> {
+        self.migrate(&[SchemaChange::RenameTable {
+            table: table.to_owned(),
+            new_name: new_name.to_owned(),
+        }])
+    }
+
+    /// Renames a field and moves every document's value to the new name.
+    ///
+    /// # Errors
+    /// Fails when the field does not exist or the new name is invalid or taken.
+    pub fn rename_field(&self, table: &str, field: &str, new_name: &str) -> Result<()> {
+        self.migrate(&[SchemaChange::RenameField {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            new_name: new_name.to_owned(),
+        }])
+    }
+
+    /// Changes a field's type and converts every stored value.
+    ///
+    /// # Errors
+    /// [`DbError::CannotConvert`] when a stored value does not fit the new
+    /// type; nothing is changed in that case.
+    pub fn change_field_type(&self, table: &str, field: &str, to: FieldType) -> Result<()> {
+        self.migrate(&[SchemaChange::ChangeType {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            to,
+        }])
+    }
+
+    /// Makes a field required or optional.
+    ///
+    /// # Errors
+    /// [`DbError::MissingValues`] when making it required while some
+    /// documents have no value for it.
+    pub fn set_required(&self, table: &str, field: &str, required: bool) -> Result<()> {
+        self.migrate(&[SchemaChange::SetRequired {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            required,
+        }])
+    }
+
+    /// Adds one more allowed value to an enum field.
+    ///
+    /// # Errors
+    /// Fails when the field is not an enum or already allows the value.
+    pub fn add_enum_value(&self, table: &str, field: &str, value: &str) -> Result<()> {
+        self.migrate(&[SchemaChange::AddEnumValue {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            value: value.to_owned(),
+        }])
+    }
+
+    /// Removes an allowed value from an enum field.
+    ///
+    /// # Errors
+    /// [`DbError::EnumValueInUse`] when documents still hold the value.
+    pub fn remove_enum_value(&self, table: &str, field: &str, value: &str) -> Result<()> {
+        self.migrate(&[SchemaChange::RemoveEnumValue {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            value: value.to_owned(),
+        }])
+    }
+
+    /// Says in plain words what a table holds, or what one of its fields
+    /// means when `field` is given.
+    ///
+    /// # Errors
+    /// Fails when the table or field does not exist.
+    pub fn set_description(&self, table: &str, field: Option<&str>, text: &str) -> Result<()> {
+        self.migrate(&[SchemaChange::Describe {
+            table: table.to_owned(),
+            field: field.map(str::to_owned),
+            description: text.to_owned(),
+        }])
+    }
+
+    /// Removes a field and its value from every document. When documents
+    /// hold a value for it, this refuses unless `force` is true.
+    ///
+    /// # Errors
+    /// [`DbError::WouldDestroy`] when data would be lost and `force` is false.
+    pub fn remove_field(&self, table: &str, field: &str, force: bool) -> Result<()> {
+        self.migrate(&[SchemaChange::RemoveField {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            force,
+        }])
+    }
+
+    /// Deletes a table. When it holds documents, this refuses unless `force`
+    /// is true.
+    ///
+    /// # Errors
+    /// [`DbError::TableReferenced`] when another table links to it,
+    /// [`DbError::WouldDestroy`] when documents would be lost and `force` is
+    /// false.
+    pub fn drop_table(&self, table: &str, force: bool) -> Result<()> {
+        self.migrate(&[SchemaChange::DropTable {
+            table: table.to_owned(),
+            force,
+        }])
+    }
+}
+
+/// Says which step of a multi-step migration failed. A single change keeps
+/// its own error.
+fn step_error(step: usize, of: usize, source: DbError) -> DbError {
+    if of > 1 {
+        DbError::StepFailed {
+            step,
+            of,
+            source: Box::new(source),
+        }
+    } else {
+        source
+    }
+}
+
+/// Applies one change and returns the name of the table it affected.
+fn apply(conn: &Connection, change: &SchemaChange) -> Result<String> {
+    use SchemaChange as C;
+    let table = match change {
+        C::DefineTable { table } => return define_table(conn, table).map(|()| table.name.clone()),
+        C::RenameTable { table, new_name } => {
+            return rename_table(conn, table, new_name).map(|()| new_name.clone());
+        }
+        C::AddField { table, field } => add_field(conn, table, field).map(|()| table),
+        C::RenameField {
+            table,
+            field,
+            new_name,
+        } => rename_field(conn, table, field, new_name).map(|()| table),
+        C::ChangeType { table, field, to } => change_type(conn, table, field, to).map(|()| table),
+        C::SetRequired {
+            table,
+            field,
+            required,
+        } => set_required(conn, table, field, *required).map(|()| table),
+        C::AddEnumValue {
+            table,
+            field,
+            value,
+        } => add_enum_value(conn, table, field, value).map(|()| table),
+        C::RemoveEnumValue {
+            table,
+            field,
+            value,
+        } => remove_enum_value(conn, table, field, value).map(|()| table),
+        C::Describe {
+            table,
+            field,
+            description,
+        } => describe(conn, table, field.as_deref(), description).map(|()| table),
+        C::RemoveField {
+            table,
+            field,
+            force,
+        } => remove_field(conn, table, field, *force).map(|()| table),
+        C::DropTable { table, force } => drop_table(conn, table, *force).map(|()| table),
+    }?;
+    Ok(table.clone())
+}
+
+fn define_table(conn: &Connection, def: &TableDef) -> Result<()> {
+    def.validate()?;
+    for field in &def.fields {
+        check_ref_target(conn, &field.kind, Some(&def.name))?;
+    }
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO _tables (name, schema) VALUES (?1, ?2)",
+        params![def.name, to_json(def)?],
+    )?;
+    if inserted == 0 {
+        return Err(DbError::TableExists {
+            table: def.name.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn add_field(conn: &Connection, table: &str, field: &Field) -> Result<()> {
+    validate_field(field)?;
+    let mut def = load_def(conn, table)?;
+    if def.field(&field.name).is_some() {
+        return Err(DbError::FieldExists {
+            table: table.to_owned(),
+            field: field.name.clone(),
+        });
+    }
+    check_ref_target(conn, &field.kind, Some(table))?;
+    let count = count_docs(conn, table)?;
+    if field.required && count > 0 {
+        return Err(DbError::RequiredFieldOnExistingDocs {
+            table: table.to_owned(),
+            field: field.name.clone(),
+            count,
+        });
+    }
+    def.fields.push(field.clone());
+    save_def(conn, &def)
+}
+
+fn rename_table(conn: &Connection, table: &str, new_name: &str) -> Result<()> {
+    check_name(new_name)?;
+    let mut def = load_def(conn, table)?;
+    if all_defs(conn)?.iter().any(|other| other.name == new_name) {
+        return Err(DbError::TableExists {
+            table: new_name.to_owned(),
+        });
+    }
+    new_name.clone_into(&mut def.name);
+    conn.execute(
+        "UPDATE _tables SET name = ?2, schema = ?3 WHERE name = ?1",
+        params![table, new_name, to_json(&def)?],
+    )?;
+    conn.execute(
+        "UPDATE docs SET tbl = ?2 WHERE tbl = ?1",
+        params![table, new_name],
+    )?;
+    for mut other in all_defs(conn)? {
+        if retarget(&mut other, table, new_name) {
+            save_def(conn, &other)?;
+        }
+    }
+    Ok(())
+}
+
+fn rename_field(conn: &Connection, table: &str, field: &str, new_name: &str) -> Result<()> {
+    let mut def = load_def(conn, table)?;
+    if def.field(new_name).is_some() {
+        return Err(DbError::FieldExists {
+            table: table.to_owned(),
+            field: new_name.to_owned(),
+        });
+    }
+    let target = field_mut(&mut def, field)?;
+    new_name.clone_into(&mut target.name);
+    validate_field(target)?;
+    save_def(conn, &def)?;
+    for (id, mut fields) in load_rows(conn, table)? {
+        if let Some(value) = fields.remove(field) {
+            fields.insert(new_name.to_owned(), value);
+            store_row(conn, table, id, &fields)?;
+        }
+    }
+    Ok(())
+}
+
+fn change_type(conn: &Connection, table: &str, field: &str, to: &FieldType) -> Result<()> {
+    let mut def = load_def(conn, table)?;
+    check_ref_target(conn, to, Some(table))?;
+    let target = field_mut(&mut def, field)?;
+    target.kind = to.clone();
+    validate_field(target)?;
+    save_def(conn, &def)?;
+    let mut misfits: Vec<(i64, Value)> = Vec::new();
+    for (id, mut fields) in load_rows(conn, table)? {
+        let Some(value) = fields.get(field).cloned() else {
+            continue;
+        };
+        match convert(conn, table, field, to, &value)? {
+            Some(converted) => {
+                fields.insert(field.to_owned(), converted);
+                store_row(conn, table, id, &fields)?;
+            }
+            None => misfits.push((id, value)),
+        }
+    }
+    match misfits.first() {
+        None => Ok(()),
+        Some((example_id, example)) => Err(DbError::CannotConvert {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            to: to.describe(),
+            count: misfits.len(),
+            example_id: *example_id,
+            example: example.to_string(),
+        }),
+    }
+}
+
+/// The value as the new type would store it, or `None` when it does not fit.
+fn convert(
+    conn: &Connection,
+    table: &str,
+    field: &str,
+    to: &FieldType,
+    value: &Value,
+) -> Result<Option<Value>> {
+    let candidate = match (to, value) {
+        (FieldType::Text, Value::Number(number)) => Some(Value::String(number.to_string())),
+        (FieldType::Text, Value::Bool(flag)) => Some(Value::String(flag.to_string())),
+        (FieldType::Number, Value::String(text)) => parse_number(text),
+        (FieldType::Bool, Value::String(text)) => match text.trim().to_lowercase().as_str() {
+            "true" | "yes" => Some(Value::Bool(true)),
+            "false" | "no" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        _ => Some(value.clone()),
+    };
+    let Some(stored) = candidate.and_then(|value| to.coerce(table, field, &value).ok()) else {
+        return Ok(None);
+    };
+    if let (FieldType::Ref { table: target }, Some(id)) = (to, stored.as_i64())
+        && !doc_exists(conn, target, id)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(stored))
+}
+
+fn parse_number(text: &str) -> Option<Value> {
+    let text = text.trim();
+    text.parse::<i64>().map(Value::from).ok().or_else(|| {
+        let number = text.parse::<f64>().ok()?;
+        Number::from_f64(number).map(Value::Number)
+    })
+}
+
+fn set_required(conn: &Connection, table: &str, field: &str, required: bool) -> Result<()> {
+    let mut def = load_def(conn, table)?;
+    field_mut(&mut def, field)?.required = required;
+    let missing = count_docs(conn, table)? - count_set(conn, table, field)?;
+    if required && missing > 0 {
+        return Err(DbError::MissingValues {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            count: missing,
+        });
+    }
+    save_def(conn, &def)
+}
+
+fn enum_values<'a>(def: &'a mut TableDef, table: &str, field: &str) -> Result<&'a mut Vec<String>> {
+    match &mut field_mut(def, field)?.kind {
+        FieldType::Enum { values } => Ok(values),
+        _ => Err(DbError::NotAnEnum {
+            table: table.to_owned(),
+            field: field.to_owned(),
+        }),
+    }
+}
+
+fn add_enum_value(conn: &Connection, table: &str, field: &str, value: &str) -> Result<()> {
+    let mut def = load_def(conn, table)?;
+    let values = enum_values(&mut def, table, field)?;
+    if values.iter().any(|existing| existing == value) {
+        return Err(DbError::EnumValueExists {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            value: value.to_owned(),
+        });
+    }
+    values.push(value.to_owned());
+    save_def(conn, &def)
+}
+
+fn remove_enum_value(conn: &Connection, table: &str, field: &str, value: &str) -> Result<()> {
+    let mut def = load_def(conn, table)?;
+    let values = enum_values(&mut def, table, field)?;
+    if !values.iter().any(|existing| existing == value) {
+        return Err(DbError::EnumValueMissing {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            value: value.to_owned(),
+            allowed: values.clone(),
+        });
+    }
+    if values.len() == 1 {
+        return Err(DbError::EmptyEnum {
+            field: field.to_owned(),
+        });
+    }
+    let count: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM docs WHERE tbl = ?1 AND json_extract(body, '$.{field}') = ?2"
+        ),
+        params![table, value],
+        |row| row.get(0),
+    )?;
+    if count > 0 {
+        return Err(DbError::EnumValueInUse {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            value: value.to_owned(),
+            count,
+        });
+    }
+    values.retain(|existing| existing != value);
+    save_def(conn, &def)
+}
+
+fn describe(conn: &Connection, table: &str, field: Option<&str>, description: &str) -> Result<()> {
+    let mut def = load_def(conn, table)?;
+    let text = (!description.trim().is_empty()).then(|| description.trim().to_owned());
+    match field {
+        Some(field) => field_mut(&mut def, field)?.description = text,
+        None => def.description = text,
+    }
+    save_def(conn, &def)
+}
+
+fn remove_field(conn: &Connection, table: &str, field: &str, force: bool) -> Result<()> {
+    let mut def = load_def(conn, table)?;
+    field_mut(&mut def, field)?;
+    let count = count_set(conn, table, field)?;
+    if count > 0 && !force {
+        return Err(DbError::WouldDestroy {
+            what: format!("the `{field}` value of `{table}` documents"),
+            count,
+        });
+    }
+    def.fields.retain(|existing| existing.name != field);
+    save_def(conn, &def)?;
+    for (id, mut fields) in load_rows(conn, table)? {
+        if fields.remove(field).is_some() {
+            store_row(conn, table, id, &fields)?;
+        }
+    }
+    Ok(())
+}
+
+fn drop_table(conn: &Connection, table: &str, force: bool) -> Result<()> {
+    load_def(conn, table)?;
+    for other in all_defs(conn)? {
+        let link = other.fields.iter().find(|field| links_to(field, table));
+        if let Some(link) = link
+            && other.name != table
+        {
+            return Err(DbError::TableReferenced {
+                table: table.to_owned(),
+                by_table: other.name,
+                by_field: link.name.clone(),
+            });
+        }
+    }
+    let count = count_docs(conn, table)?;
+    if count > 0 && !force {
+        return Err(DbError::WouldDestroy {
+            what: format!("table `{table}` and everything in it"),
+            count,
+        });
+    }
+    conn.execute("DELETE FROM docs WHERE tbl = ?1", [table])?;
+    conn.execute("DELETE FROM _tables WHERE name = ?1", [table])?;
+    Ok(())
+}
+
+fn links_to(field: &Field, table: &str) -> bool {
+    matches!(&field.kind, FieldType::Ref { table: target } if target == table)
+}
+
+/// Points every link to `from` at `to` instead. Returns whether any changed.
+fn retarget(def: &mut TableDef, from: &str, to: &str) -> bool {
+    let mut changed = false;
+    for field in &mut def.fields {
+        if let FieldType::Ref { table } = &mut field.kind
+            && table == from
+        {
+            to.clone_into(table);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn field_mut<'a>(def: &'a mut TableDef, name: &str) -> Result<&'a mut Field> {
+    let unknown = def.unknown_field(name, false);
+    def.fields
+        .iter_mut()
+        .find(|field| field.name == name)
+        .ok_or(unknown)
+}
+
+fn save_def(conn: &Connection, def: &TableDef) -> Result<()> {
+    conn.execute(
+        "UPDATE _tables SET schema = ?2 WHERE name = ?1",
+        params![def.name, to_json(def)?],
+    )?;
+    Ok(())
+}
+
+/// How many documents hold a value for `field`. The name comes from the
+/// schema, so it is safe to place in the SQL text.
+fn count_set(conn: &Connection, table: &str, field: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        &format!("SELECT count(*) FROM docs WHERE tbl = ?1 AND json_extract(body, '$.{field}') IS NOT NULL"),
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
+fn load_rows(conn: &Connection, table: &str) -> Result<Vec<(i64, Map<String, Value>)>> {
+    conn.prepare("SELECT id, body FROM docs WHERE tbl = ?1")?
+        .query_map([table], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .map(|row| {
+            let (id, body) = row?;
+            Ok((id, from_json(&body)?))
+        })
+        .collect()
+}
+
+fn store_row(conn: &Connection, table: &str, id: i64, fields: &Map<String, Value>) -> Result<()> {
+    conn.execute(
+        "UPDATE docs SET body = ?3 WHERE tbl = ?1 AND id = ?2",
+        params![table, id, to_json(fields)?],
+    )?;
+    Ok(())
+}

@@ -1,0 +1,492 @@
+{
+ "now": "2026-10-03T12:00:00Z",
+ "tables": [
+  {
+   "name": "companies",
+   "fields": [
+    {
+     "name": "name",
+     "type": "text",
+     "required": true
+    },
+    {
+     "name": "industry",
+     "type": "enum",
+     "values": [
+      "software",
+      "fintech",
+      "retail",
+      "health"
+     ],
+     "required": false
+    },
+    {
+     "name": "country",
+     "type": "text",
+     "required": false
+    }
+   ]
+  },
+  {
+   "name": "employees",
+   "fields": [
+    {
+     "name": "name",
+     "type": "text",
+     "required": true
+    },
+    {
+     "name": "email",
+     "type": "text",
+     "required": false
+    },
+    {
+     "name": "role",
+     "type": "enum",
+     "values": [
+      "sales",
+      "support",
+      "engineer",
+      "manager"
+     ],
+     "required": false
+    },
+    {
+     "name": "salary",
+     "type": "number",
+     "required": false
+    },
+    {
+     "name": "hired_at",
+     "type": "datetime",
+     "required": false
+    },
+    {
+     "name": "remote",
+     "type": "bool",
+     "required": false
+    }
+   ]
+  },
+  {
+   "name": "clients",
+   "fields": [
+    {
+     "name": "name",
+     "type": "text",
+     "required": true
+    },
+    {
+     "name": "email",
+     "type": "text",
+     "required": false
+    },
+    {
+     "name": "status",
+     "type": "enum",
+     "values": [
+      "lead",
+      "active",
+      "churned"
+     ],
+     "required": false
+    },
+    {
+     "name": "revenue",
+     "type": "number",
+     "required": false
+    },
+    {
+     "name": "vip",
+     "type": "bool",
+     "required": false
+    },
+    {
+     "name": "signed_at",
+     "type": "datetime",
+     "required": false
+    },
+    {
+     "name": "last_contacted_at",
+     "type": "datetime",
+     "required": false
+    },
+    {
+     "name": "company",
+     "type": "ref",
+     "table": "companies",
+     "required": false
+    },
+    {
+     "name": "owner",
+     "type": "ref",
+     "table": "employees",
+     "required": false
+    }
+   ]
+  }
+ ],
+ "docs": [
+  {
+   "table": "companies",
+   "at": "2025-01-01T09:00:00Z",
+   "doc": {
+    "name": "Northwind",
+    "industry": "software",
+    "country": "Poland"
+   }
+  },
+  {
+   "table": "companies",
+   "at": "2025-01-01T09:00:00Z",
+   "doc": {
+    "name": "Contoso",
+    "industry": "fintech",
+    "country": "USA"
+   }
+  },
+  {
+   "table": "companies",
+   "at": "2025-01-01T09:00:00Z",
+   "doc": {
+    "name": "Fabrikam",
+    "industry": "retail",
+    "country": "Germany"
+   }
+  },
+  {
+   "table": "companies",
+   "at": "2025-01-01T09:00:00Z",
+   "doc": {
+    "name": "Medica",
+    "industry": "health",
+    "country": "Poland"
+   }
+  },
+  {
+   "table": "employees",
+   "at": "2022-03-01T09:00:00Z",
+   "doc": {
+    "name": "Anna Kowalska",
+    "email": "anna@example.com",
+    "role": "sales",
+    "salary": 9000,
+    "hired_at": "2022-03-01",
+    "remote": false
+   }
+  },
+  {
+   "table": "employees",
+   "at": "2023-09-15T09:00:00Z",
+   "doc": {
+    "name": "Ben Carter",
+    "email": "ben@example.com",
+    "role": "sales",
+    "salary": 8500,
+    "hired_at": "2023-09-15",
+    "remote": true
+   }
+  },
+  {
+   "table": "employees",
+   "at": "2021-01-10T09:00:00Z",
+   "doc": {
+    "name": "Chloe Nguyen",
+    "email": "chloe@example.com",
+    "role": "sales",
+    "salary": 11000,
+    "hired_at": "2021-01-10",
+    "remote": false
+   }
+  },
+  {
+   "table": "employees",
+   "at": "2026-09-01T09:00:00Z",
+   "doc": {
+    "name": "David Okafor",
+    "email": "david@example.com",
+    "role": "support",
+    "salary": 6000,
+    "hired_at": "2026-09-01",
+    "remote": true
+   }
+  },
+  {
+   "table": "employees",
+   "at": "2020-06-20T09:00:00Z",
+   "doc": {
+    "name": "Eva Lindqvist",
+    "email": "eva@example.com",
+    "role": "engineer",
+    "salary": 14000,
+    "hired_at": "2020-06-20",
+    "remote": true
+   }
+  },
+  {
+   "table": "employees",
+   "at": "2026-10-01T09:00:00Z",
+   "doc": {
+    "name": "Filip Nowak",
+    "email": "filip@example.com",
+    "role": "engineer",
+    "salary": 12500,
+    "hired_at": "2026-10-01",
+    "remote": false
+   }
+  },
+  {
+   "table": "employees",
+   "at": "2019-04-04T09:00:00Z",
+   "doc": {
+    "name": "Grace Kim",
+    "email": "grace@example.com",
+    "role": "manager",
+    "salary": 18000,
+    "hired_at": "2019-04-04",
+    "remote": false
+   }
+  },
+  {
+   "table": "employees",
+   "at": "2025-11-11T09:00:00Z",
+   "doc": {
+    "name": "Hugo Martin",
+    "email": "hugo@example.com",
+    "role": "support",
+    "salary": 6200,
+    "hired_at": "2025-11-11",
+    "remote": true
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-10-03T08:00:00Z",
+   "doc": {
+    "name": "Acme Corp",
+    "status": "active",
+    "revenue": 12000,
+    "vip": true,
+    "company": 1,
+    "owner": 1,
+    "signed_at": "2026-03-10",
+    "last_contacted_at": "2026-10-02",
+    "email": "hello@acme.com"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-10-03T09:30:00Z",
+   "doc": {
+    "name": "Globex",
+    "status": "lead",
+    "revenue": 0,
+    "vip": false,
+    "company": 2,
+    "owner": 2,
+    "last_contacted_at": "2026-10-03",
+    "email": "hello@globex.com"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-10-03T11:00:00Z",
+   "doc": {
+    "name": "Initech",
+    "status": "lead",
+    "revenue": 500,
+    "vip": false,
+    "company": 3,
+    "owner": 1
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-10-02T10:00:00Z",
+   "doc": {
+    "name": "Umbrella Health",
+    "status": "active",
+    "revenue": 7500,
+    "vip": true,
+    "company": 4,
+    "owner": 3,
+    "signed_at": "2026-10-02",
+    "last_contacted_at": "2026-09-30",
+    "email": "hello@umbrella.com"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-10-02T15:00:00Z",
+   "doc": {
+    "name": "Hooli",
+    "status": "churned",
+    "revenue": 3000,
+    "vip": false,
+    "company": 1,
+    "owner": 2,
+    "signed_at": "2025-06-01",
+    "last_contacted_at": "2026-07-15",
+    "email": "hello@hooli.com"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-09-29T10:00:00Z",
+   "doc": {
+    "name": "Stark Industries",
+    "status": "active",
+    "revenue": 45000,
+    "vip": true,
+    "company": 2,
+    "owner": 1,
+    "signed_at": "2026-01-20",
+    "last_contacted_at": "2026-09-29",
+    "email": "hello@stark.com"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-09-28T10:00:00Z",
+   "doc": {
+    "name": "Wayne Enterprises",
+    "status": "active",
+    "revenue": 30000,
+    "vip": true,
+    "company": 3,
+    "owner": 3,
+    "signed_at": "2025-11-05",
+    "last_contacted_at": "2026-09-25",
+    "email": "hello@wayne.com"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-09-24T10:00:00Z",
+   "doc": {
+    "name": "Acme Labs",
+    "status": "lead",
+    "revenue": 1500,
+    "vip": false,
+    "company": 1,
+    "owner": 2,
+    "last_contacted_at": "2026-09-24"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-09-22T10:00:00Z",
+   "doc": {
+    "name": "Soylent",
+    "status": "churned",
+    "revenue": 800,
+    "vip": false,
+    "company": 4,
+    "owner": 4,
+    "signed_at": "2025-02-14",
+    "last_contacted_at": "2026-03-01",
+    "email": "hello@soylent.com"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-09-10T10:00:00Z",
+   "doc": {
+    "name": "Pied Piper",
+    "status": "active",
+    "revenue": 5000,
+    "vip": false,
+    "company": 2,
+    "owner": 4,
+    "signed_at": "2026-09-10",
+    "last_contacted_at": "2026-09-20",
+    "email": "hello@pied.com"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-09-01T10:00:00Z",
+   "doc": {
+    "name": "Cyberdyne",
+    "status": "lead",
+    "revenue": 250,
+    "vip": false,
+    "company": 3,
+    "owner": 1
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-08-15T10:00:00Z",
+   "doc": {
+    "name": "Wonka",
+    "status": "active",
+    "revenue": 9900,
+    "vip": false,
+    "company": 4,
+    "owner": 3,
+    "signed_at": "2026-08-20",
+    "last_contacted_at": "2026-10-01",
+    "email": "hello@wonka.com"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-07-04T10:00:00Z",
+   "doc": {
+    "name": "Tyrell",
+    "status": "churned",
+    "revenue": 15000,
+    "vip": true,
+    "company": 1,
+    "owner": 2,
+    "signed_at": "2024-12-01",
+    "last_contacted_at": "2026-05-05",
+    "email": "hello@tyrell.com"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2026-03-12T10:00:00Z",
+   "doc": {
+    "name": "Oscorp",
+    "status": "active",
+    "revenue": 2200,
+    "vip": false,
+    "company": 2,
+    "owner": 4,
+    "signed_at": "2026-03-15",
+    "last_contacted_at": "2026-08-08",
+    "email": "hello@oscorp.com"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2025-12-20T10:00:00Z",
+   "doc": {
+    "name": "Massive Dynamic",
+    "status": "active",
+    "revenue": 60000,
+    "vip": true,
+    "company": 3,
+    "owner": 1,
+    "signed_at": "2025-12-22",
+    "last_contacted_at": "2026-09-27",
+    "email": "hello@massive.com"
+   }
+  },
+  {
+   "table": "clients",
+   "at": "2025-05-05T10:00:00Z",
+   "doc": {
+    "name": "Vandelay",
+    "status": "lead",
+    "revenue": 100,
+    "vip": false,
+    "company": 4,
+    "owner": 3,
+    "last_contacted_at": "2025-06-01"
+   }
+  }
+ ]
+}
