@@ -144,3 +144,14 @@ aside h2 { padding: 14px 14px 8px; }
   aside { border-left: none; border-top: 1px solid var(--line); }
 }
 @media (prefers-reduced-motion: reduce) { tr.flash td { animation: none; } }
+
+.login {
+  max-width: 22rem;
+  margin: 18vh auto 0;
+  padding: 0 1rem;
+}
+.login form {
+  display: grid;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}

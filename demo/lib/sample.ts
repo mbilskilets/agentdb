@@ -1,6 +1,10 @@
-import type { Tenant } from "agentdb";
+import type { Fields, Tenant, Write } from "agentdb";
 
-/** Creates three linked tables and a few documents to play with. */
+/**
+ * Creates three linked tables and a few documents to play with. The
+ * documents go in as one batch: a client refers to its company and its
+ * owner by the ids those get earlier in the same batch.
+ */
 export async function loadSample(db: Tenant) {
   await db.migrate([
     {
@@ -36,8 +40,8 @@ export async function loadSample(db: Tenant) {
         description: "Customers and prospects",
         fields: [
           { name: "name", type: "text", required: true },
-          { name: "email", type: "text", required: false },
-          { name: "status", type: "enum", values: ["lead", "active", "churned"], required: false },
+          { name: "email", type: "text", required: false, unique: true },
+          { name: "status", type: "enum", values: ["lead", "active", "churned"], required: false, indexed: true },
           { name: "revenue", type: "number", required: false },
           { name: "vip", type: "bool", required: false },
           { name: "signed_at", type: "datetime", required: false },
@@ -66,8 +70,7 @@ export async function loadSample(db: Tenant) {
     { name: "Hooli", email: "hello@hooli.com", status: "churned", revenue: 3000, vip: false, signed_at: "2025-06-01", company: 2, owner: 2 },
     { name: "Stark Industries", email: "hello@stark.com", status: "active", revenue: 45000, vip: true, signed_at: "2026-01-20", company: 3, owner: 1 },
   ];
-  for (const doc of companies) await db.insert("companies", doc);
-  for (const doc of employees) await db.insert("employees", doc);
-  for (const doc of clients) await db.insert("clients", doc);
+  const inserts = (table: string, docs: Fields[]): Write[] => docs.map((doc) => ({ op: "insert", table, doc }));
+  await db.batch([...inserts("companies", companies), ...inserts("employees", employees), ...inserts("clients", clients)]);
   return db.describe();
 }
