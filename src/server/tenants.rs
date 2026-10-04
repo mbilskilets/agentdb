@@ -81,15 +81,15 @@ impl Drop for Busy<'_> {
 ///
 /// A tenant never has two handles at once: a subscriber hears only the
 /// writes made through the handle it subscribed on. The lock on `slots` is
-/// never held while a file is opened or closed, so one tenant's slow disk
-/// does not hold up the others.
+/// never held while a file is looked for, opened or closed, so one tenant's
+/// slow disk does not hold up the others.
 pub(super) struct Tenants {
     data_dir: PathBuf,
     master_key: String,
     max_open: usize,
     slots: Mutex<HashMap<String, Slot>>,
     settled: Condvar,
-    created: watch::Sender<()>,
+    opened: watch::Sender<()>,
 }
 
 impl Tenants {
@@ -100,7 +100,7 @@ impl Tenants {
             max_open,
             slots: Mutex::new(HashMap::new()),
             settled: Condvar::new(),
-            created: watch::Sender::new(()),
+            opened: watch::Sender::new(()),
         }
     }
 
@@ -112,36 +112,36 @@ impl Tenants {
         missing: Missing,
     ) -> Result<Option<Arc<AgentDb>>, ApiError> {
         check_id(id)?;
+        let path = self.data_dir.join(format!("{id}.db"));
+        if missing == Missing::Skip && !path.try_exists().map_err(ApiError::internal)? {
+            return Ok(None);
+        }
         let busy = match self.claim(id)? {
             Claimed::Open(db) => return Ok(Some(db)),
             Claimed::Ours(busy) => busy,
         };
-        let path = self.data_dir.join(format!("{id}.db"));
-        let exists = path.try_exists().map_err(ApiError::internal)?;
-        if !exists && missing == Missing::Skip {
-            return Ok(None);
-        }
         self.make_room()?;
         std::fs::create_dir_all(&self.data_dir).map_err(ApiError::internal)?;
         let db = Arc::new(AgentDb::open(path, &self.key(id)?)?);
         busy.opened(&db)?;
-        if !exists {
-            self.created.send_replace(());
-        }
+        self.opened.send_replace(());
         Ok(Some(db))
     }
 
-    /// Changes whenever a tenant's database file is created.
-    pub(super) fn created(&self) -> watch::Receiver<()> {
-        self.created.subscribe()
+    /// Changes whenever a tenant's database is opened. A subscriber that
+    /// waits for a tenant without a file looks again then.
+    pub(super) fn opened(&self) -> watch::Receiver<()> {
+        self.opened.subscribe()
     }
 
     /// Closes every database that no request and no subscriber still holds.
     pub(super) fn close(&self) {
-        self.slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let closing: Vec<_> = slots
+            .extract_if(|_, slot| matches!(slot, Slot::Open { .. }))
+            .collect();
+        drop(slots);
+        drop(closing);
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, HashMap<String, Slot>>, ApiError> {

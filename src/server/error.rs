@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::DbError;
 
 const SERVER_FAULT: &str = "agentdb failed while handling this request. The fault is on the server, not in the call: retry it, and if it keeps failing the operator will find the cause in the server log.";
+const MODEL_UNAVAILABLE: &str = "ask() could not get an answer from the language model. find() works without the model. If this keeps happening, the operator will find the cause in the server log.";
 
 /// An error as the caller sees it: `{"error": {"code": ..., "message": ...}}`.
 #[derive(Debug)]
@@ -33,12 +34,14 @@ impl ApiError {
     /// the caller is told only that the server is at fault: the detail can
     /// name files, SQL and other things a caller has no business knowing.
     pub(super) fn internal(detail: impl Display) -> Self {
-        Self::server_fault("internal", &detail)
+        Self::logged("internal", &detail, SERVER_FAULT)
     }
 
-    fn server_fault(code: &'static str, detail: &dyn Display) -> Self {
+    /// An error whose detail is for the operator: it goes to the log, and
+    /// the caller reads `message` in its place.
+    fn logged(code: &'static str, detail: &dyn Display, message: &str) -> Self {
         eprintln!("agentdb: {code} error: {detail}");
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, code, SERVER_FAULT)
+        Self::new(status_of(code), code, message)
     }
 
     fn body(&self) -> Value {
@@ -56,7 +59,8 @@ impl ApiError {
 impl From<DbError> for ApiError {
     fn from(error: DbError) -> Self {
         match error.code() {
-            code @ ("storage" | "internal") => Self::server_fault(code, &error),
+            code @ ("storage" | "internal") => Self::logged(code, &error, SERVER_FAULT),
+            code @ "model_unavailable" => Self::logged(code, &error, MODEL_UNAVAILABLE),
             code => Self::new(status_of(code), code, error.to_string()),
         }
     }
@@ -83,7 +87,32 @@ fn status_of(code: &str) -> StatusCode {
         "batch_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
         "missing_api_key" => StatusCode::SERVICE_UNAVAILABLE,
         "model_unavailable" => StatusCode::BAD_GATEWAY,
-        "newer_format" | "wrong_key" | "empty_key" => StatusCode::INTERNAL_SERVER_ERROR,
+        "storage" | "internal" | "newer_format" | "wrong_key" | "empty_key" => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
         _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::ApiError;
+    use crate::DbError;
+
+    #[test]
+    fn what_went_wrong_with_the_model_stays_in_the_log() {
+        let error = ApiError::from(DbError::Jev(
+            "dns lookup of model.internal:443 failed".to_owned(),
+        ));
+        assert_eq!(
+            (error.status, error.code),
+            (StatusCode::BAD_GATEWAY, "model_unavailable")
+        );
+        assert_eq!(
+            error.message,
+            "ask() could not get an answer from the language model. find() works without the model. If this keeps happening, the operator will find the cause in the server log."
+        );
     }
 }

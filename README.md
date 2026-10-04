@@ -301,7 +301,7 @@ By default you get changes made after you subscribe. Pass `{ since: seq }` to re
 
 The server keeps the newest 10,000 changes of each tenant. A subscriber catches up from that log after a dropped connection, and also when it reads slower than agents write. Either way it still gets every change, in order.
 
-A subscriber that falls more than 10,000 changes behind cannot catch up. The SDK then calls `onGap` and carries on with the writes made after that call. Read your data again inside `onGap` and you are back in step.
+A subscriber that falls more than 10,000 changes behind cannot catch up. The SDK then calls `onGap` and carries on with the writes made after that call. Read your data again inside `onGap` and you are back in step. The same happens when the subscriber is ahead of the log, which means someone replaced the database with an older copy.
 
 `db.changes(since)` reads the same log by hand. It returns up to 500 changes after `since`, and `latest_seq`, the `seq` of the newest write. `db.changes()` returns only `latest_seq`. A `since` older than the log reaches fails with `changes_trimmed`.
 
@@ -453,13 +453,13 @@ The SDK is a thin wrapper over this. All tenant routes need the bearer secret an
 
 A write in a batch is `{ "op": "insert", "table", "doc" }`, `{ "op": "update", "table", "id", "patch", "version"? }` or `{ "op": "delete", "table", "id", "version"? }`.
 
-Each event of `/subscribe` carries one change as JSON, with its `seq` as the event id. When a subscriber has fallen further behind than the change log reaches, the last event is named `error` and carries the `changes_trimmed` error. Then the stream ends.
+Each event of `/subscribe` carries one change as JSON, with its `seq` as the event id. When a subscriber has fallen further behind than the change log reaches, the last event is named `error` and carries the `changes_trimmed` error. Then the stream ends. A `since` that the log has not reached yet is refused with `since_ahead`, because following it would hide every write until the log got there. A subscriber that reads nothing for 30 seconds while changes wait for it has its stream closed, so that it cannot keep the tenant's database open. It reconnects with the last `seq` it saw.
 
 Only `POST /migrate` creates a tenant's file. Every other route treats a tenant without a file as an empty database and leaves the disk alone.
 
 A request body can be 8 MiB at most. A larger one is refused with `request_too_large`.
 
-Errors come back as `{ "error": { "code": "...", "message": "..." } }` with a matching HTTP status. That is 404 for a table or document that does not exist, 409 when stored data stands in the way, such as a version conflict or a duplicate value, 410 for `changes_trimmed`, 413 for a batch or a body that is too large, and 400 for any other call that has to change. When the server itself fails, the status is 500 and the code `storage` or `internal`. The message then says only that the fault is the server's, and the detail goes to the server's log.
+Errors come back as `{ "error": { "code": "...", "message": "..." } }` with a matching HTTP status. That is 404 for a table or document that does not exist, 409 when stored data stands in the way, such as a version conflict or a duplicate value, 410 for `changes_trimmed` and `since_ahead`, 413 for a batch or a body that is too large, and 400 for any other call that has to change. When the server itself fails, the status is 500 and the code `storage` or `internal`. The message then says only that the fault is the server's, and the detail goes to the server's log.
 
 ## Running the server
 

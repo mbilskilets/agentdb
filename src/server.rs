@@ -38,6 +38,8 @@ const MAX_BODY_MIB: usize = 8;
 const MAX_BODY_BYTES: usize = MAX_BODY_MIB * 1024 * 1024;
 /// How long requests in flight get to finish once the server is told to stop.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// How long a change feed waits for a subscriber to read the next event.
+const SUBSCRIBER_PATIENCE: Duration = Duration::from_secs(30);
 const ROUTES: &str = "Tenant routes start with /v1/tenants/{tenant}/ and end in describe, migrate, find, ask, batch, changes, subscribe, tables/{table}/docs or tables/{table}/docs/{id}.";
 
 #[derive(Debug, Clone)]
@@ -102,6 +104,7 @@ struct App {
     secret: String,
     jev: Option<Jev>,
     tenants: Tenants,
+    subscriber_patience: Duration,
     stopping: watch::Receiver<bool>,
 }
 
@@ -139,6 +142,7 @@ pub async fn serve(
         secret: config.secret,
         jev: config.jev,
         tenants: Tenants::new(config.data_dir, config.master_key, config.max_open_tenants),
+        subscriber_patience: SUBSCRIBER_PATIENCE,
         stopping,
     });
     let serving = axum::serve(listener, router(&app)).with_graceful_shutdown(async move {
@@ -189,7 +193,8 @@ async fn in_error_shape(request: Request, next: Next) -> Response {
     if !status.is_client_error() || is_ours {
         return response;
     }
-    match to_bytes(response.into_body(), MAX_BODY_BYTES).await {
+    let (written, reason) = response.into_parts();
+    let error = match to_bytes(reason, MAX_BODY_BYTES).await {
         Ok(reason) if reason.is_empty() => ApiError::new(
             status,
             "unknown_route",
@@ -204,8 +209,12 @@ async fn in_error_shape(request: Request, next: Next) -> Response {
             ),
         ),
         Err(unreadable) => ApiError::internal(unreadable),
+    };
+    let mut shaped = error.into_response();
+    if let Some(allowed) = written.headers.get(header::ALLOW) {
+        shaped.headers_mut().insert(header::ALLOW, allowed.clone());
     }
-    .into_response()
+    shaped
 }
 
 async fn authorize(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
@@ -213,9 +222,10 @@ async fn authorize(State(app): State<Arc<App>>, request: Request, next: Next) ->
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .unwrap_or_default();
-    let matches: bool = sent.as_bytes().ct_eq(app.secret.as_bytes()).into();
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let matches = sent.is_some_and(|sent| {
+        !sent.is_empty() && bool::from(sent.as_bytes().ct_eq(app.secret.as_bytes()))
+    });
     if matches {
         next.run(request).await
     } else {

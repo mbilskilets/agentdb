@@ -3,12 +3,16 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query as UrlQuery, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::error::Elapsed;
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 
@@ -29,17 +33,22 @@ const SUBSCRIBER_BUFFER: usize = 64;
 /// on, in `seq` order with none missing and none repeated. A subscriber too
 /// slow for the live writes is caught up from the log again. One that falls
 /// further behind than the log reaches is sent a last event named `error`
-/// with the `changes_trimmed` error, and the stream ends.
+/// with the `changes_trimmed` error, and the stream ends. One that stops
+/// reading altogether has its stream ended, so that it cannot keep the
+/// tenant's database open forever.
 pub(super) async fn subscribe(
     State(app): State<Arc<App>>,
     Path(tenant): Path<String>,
     UrlQuery(Since { since }): UrlQuery<Since>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let started = Feed::start(Arc::clone(&app), tenant.clone(), since).await?;
+    if let (None, Some(since)) = (&started, since.filter(|since| *since > 0)) {
+        return Err(since_ahead(since, 0));
+    }
     let (events, stream) = mpsc::channel(SUBSCRIBER_BUFFER);
     tokio::spawn(async move {
         tokio::select! {
-            () = run(&app, tenant, since, started, &events) => {}
+            () = run(&app, tenant, started, &events) => {}
             () = events.closed() => {}
             () = app.shutting_down() => {}
         }
@@ -52,14 +61,13 @@ pub(super) async fn subscribe(
 async fn run(
     app: &Arc<App>,
     tenant: String,
-    since: Option<i64>,
     started: Option<(Feed, CaughtUp)>,
     events: &mpsc::Sender<Event>,
 ) {
     let fed = async {
         let (feed, caught_up) = match started {
             Some(started) => started,
-            None => Feed::start_once_created(app, tenant, since.unwrap_or(0)).await?,
+            None => Feed::start_once_opened(app, tenant).await?,
         };
         feed.send_all(caught_up, events).await
     };
@@ -70,14 +78,33 @@ async fn run(
     }
 }
 
+/// A `since` that the tenant's change log has not reached yet. Following it
+/// would hide every write until the log got there.
+fn since_ahead(since: i64, latest: i64) -> ApiError {
+    ApiError::new(
+        StatusCode::GONE,
+        "since_ahead",
+        format!(
+            "cannot continue after seq {since}: this tenant's newest change is seq {latest}. Seq {since} comes from another database, or from this one before it was restored from a backup. Read the current state again, then continue from seq {latest}."
+        ),
+    )
+}
+
 /// Why a feed stopped.
 enum Stopped {
+    /// The subscriber left, or stopped reading.
     Unsubscribed,
     Failed(ApiError),
 }
 
 impl From<SendError<Event>> for Stopped {
     fn from(_: SendError<Event>) -> Self {
+        Self::Unsubscribed
+    }
+}
+
+impl From<Elapsed> for Stopped {
+    fn from(_: Elapsed) -> Self {
         Self::Unsubscribed
     }
 }
@@ -110,6 +137,8 @@ struct Feed {
     db: Arc<AgentDb>,
     /// The `seq` of the newest change sent, or the one to start after.
     last: i64,
+    /// How long the subscriber may take to read the next event.
+    patience: Duration,
 }
 
 impl Feed {
@@ -123,29 +152,35 @@ impl Feed {
             let Some(db) = app.tenants.open(&tenant, Missing::Skip)? else {
                 return Ok(None);
             };
-            let last = match since {
-                Some(seq) => seq,
-                None => db.latest_seq()?,
-            };
+            let latest = db.latest_seq()?;
+            let last = since.unwrap_or(latest);
+            if last > latest {
+                return Err(since_ahead(last, latest));
+            }
             let caught_up = catch_up(&db, last)?;
-            Ok(Some((Self { db, last }, caught_up)))
+            let feed = Self {
+                db,
+                last,
+                patience: app.subscriber_patience,
+            };
+            Ok(Some((feed, caught_up)))
         })
         .await
     }
 
-    /// Waits for the schema change that creates the tenant's database.
-    async fn start_once_created(
+    /// Waits until the tenant has a database, then starts with its first
+    /// change.
+    async fn start_once_opened(
         app: &Arc<App>,
         tenant: String,
-        since: i64,
     ) -> Result<(Self, CaughtUp), ApiError> {
-        let mut created = app.tenants.created();
+        let mut opened = app.tenants.opened();
         loop {
-            let started = Self::start(Arc::clone(app), tenant.clone(), Some(since)).await?;
+            let started = Self::start(Arc::clone(app), tenant.clone(), Some(0)).await?;
             if let Some(started) = started {
                 return Ok(started);
             }
-            created.changed().await.map_err(ApiError::internal)?;
+            opened.changed().await.map_err(ApiError::internal)?;
         }
     }
 
@@ -193,7 +228,7 @@ impl Feed {
             .id(change.seq.to_string())
             .json_data(change)
             .map_err(ApiError::internal)?;
-        events.send(event).await?;
+        timeout(self.patience, events.send(event)).await??;
         self.last = change.seq;
         Ok(())
     }
@@ -211,6 +246,7 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::sync::watch;
     use tokio::task::spawn_blocking;
+    use tokio::time::timeout;
     use tokio_stream::StreamExt;
 
     use super::super::tenants::{Missing, Tenants};
@@ -220,14 +256,16 @@ mod tests {
 
     const RETAINED_CHANGES: usize = 10_000;
     const LIVE_BUFFER: usize = 1_024;
+    const PATIENT: Duration = Duration::from_secs(60);
 
     /// A server's state, and the switch that would shut it down.
-    fn app(dir: &FilePath) -> (Arc<App>, watch::Sender<bool>) {
+    fn app(dir: &FilePath, subscriber_patience: Duration) -> (Arc<App>, watch::Sender<bool>) {
         let (stop, stopping) = watch::channel(false);
         let app = App {
             secret: "secret".to_owned(),
             jev: None,
             tenants: Tenants::new(dir.to_owned(), "master".to_owned(), 4),
+            subscriber_patience,
             stopping,
         };
         (Arc::new(app), stop)
@@ -316,7 +354,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_subscriber_too_slow_for_live_writes_is_caught_up_from_the_log() {
         let dir = tempfile::tempdir().unwrap();
-        let (app, _stop) = app(dir.path());
+        let (app, _stop) = app(dir.path(), PATIENT);
         let db = notes(&app);
         let mut events = Events::subscribe(&app, 0).await;
         assert_eq!(events.next_seq().await, 1);
@@ -333,7 +371,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_subscriber_behind_the_whole_log_is_told_and_the_feed_ends() {
         let dir = tempfile::tempdir().unwrap();
-        let (app, _stop) = app(dir.path());
+        let (app, _stop) = app(dir.path(), PATIENT);
         let db = notes(&app);
         let mut events = Events::subscribe(&app, 0).await;
         assert_eq!(events.next_seq().await, 1);
@@ -354,5 +392,26 @@ mod tests {
         assert_eq!(error["error"]["code"], "changes_trimmed");
         let message = error["error"]["message"].as_str().unwrap();
         assert!(message.starts_with("cannot replay changes after seq "));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscriber_that_stops_reading_is_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _stop) = app(dir.path(), Duration::from_millis(100));
+        let db = notes(&app);
+        let mut events = Events::subscribe(&app, 0).await;
+        assert_eq!(events.next_seq().await, 1);
+
+        let written = 2 * SUBSCRIBER_BUFFER;
+        write_notes(&db, written).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut received = 0;
+        while timeout(PATIENT, events.next()).await.unwrap().is_some() {
+            received += 1;
+        }
+        assert!(received < written);
+        let held_by_the_test_and_the_server = 2;
+        assert_eq!(Arc::strong_count(&db), held_by_the_test_and_the_server);
     }
 }

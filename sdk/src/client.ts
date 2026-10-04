@@ -29,16 +29,18 @@ export interface SubscribeOptions {
   /** Called when the connection drops. The subscription reconnects by itself and resumes where it left off. */
   onError?: (error: unknown) => void;
   /**
-   * Called when changes were lost for good: the server keeps the newest
-   * 10,000 changes, and the subscription fell further behind than that.
-   * Read the current state again. `onChange` carries on with the writes
-   * made after this call.
+   * Called when the change log cannot continue from where the subscription
+   * stands: it fell further behind than the 10,000 changes the server
+   * keeps, or the database was replaced by an older copy. Read the current
+   * state again. `onChange` carries on with the writes made after this call.
    */
   onGap?: () => void;
 }
 
 const FIRST_RETRY_MS = 500;
 const MAX_RETRY_MS = 5000;
+/** Errors that say the change log cannot continue from the subscriber's `seq`. */
+const LOST_PLACE = ["changes_trimmed", "since_ahead"];
 
 /** A connection to an agentdb server. Call `tenant()` to work with one tenant's database. */
 export class AgentDB {
@@ -217,7 +219,7 @@ export class Tenant {
         }
       } catch (error) {
         if (signal.aborted) return;
-        if (error instanceof AgentDBError && error.code === "changes_trimmed") {
+        if (error instanceof AgentDBError && LOST_PLACE.includes(error.code)) {
           last = undefined;
           missedChanges = true;
           continue;

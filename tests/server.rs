@@ -12,7 +12,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
-    use tokio::task::spawn_blocking;
+    use tokio::task::{JoinHandle, spawn_blocking};
     use tokio::time::timeout;
 
     const SECRET: &str = "test secret";
@@ -138,6 +138,22 @@ mod tests {
             let (status, body) = call("GET", of(&base, "acme/describe"), secret, Value::Null).await;
             assert_eq!((status, code(&body)), (401, "unauthorized"));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_without_a_secret_lets_nobody_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut no_secret = config(dir.path());
+        no_secret.secret = String::new();
+        let base = start_with(no_secret).await;
+        let describe = of(&base, "acme/describe");
+        let no_header = spawn_blocking({
+            let describe = describe.clone();
+            move || agent().get(&describe).call().unwrap().status().as_u16()
+        });
+        assert_eq!(no_header.await.unwrap(), 401);
+        let (status, body) = call("GET", describe, "", Value::Null).await;
+        assert_eq!((status, code(&body)), (401, "unauthorized"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -703,6 +719,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn subscribing_from_a_seq_the_log_has_not_reached_is_refused() {
+        let (base, _dir) = start().await;
+        define_clients(&base, "acme").await;
+        for (tenant, latest) in [("acme", 1), ("nobody", 0)] {
+            let ahead = of(&base, &format!("{tenant}/subscribe?since=100"));
+            let (status, body) = call("GET", ahead, SECRET, Value::Null).await;
+            assert_eq!((status, code(&body)), (410, "since_ahead"));
+            assert_eq!(
+                message(&body),
+                format!(
+                    "cannot continue after seq 100: this tenant's newest change is seq {latest}. Seq 100 comes from another database, or from this one before it was restored from a backup. Read the current state again, then continue from seq {latest}."
+                )
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_subscriber_can_wait_for_a_tenant_that_does_not_exist_yet() {
         let (base, dir) = start().await;
         let feed = subscribe(of(&base, "acme/subscribe")).await;
@@ -789,24 +822,56 @@ mod tests {
         drop(one);
     }
 
+    /// A server that stops when told to, and waits to be awaited.
+    struct Stoppable {
+        base: String,
+        stop: oneshot::Sender<()>,
+        server: JoinHandle<std::io::Result<()>>,
+    }
+
+    impl Stoppable {
+        async fn start(dir: &Path) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let (stop, stopped) = oneshot::channel::<()>();
+            let told_to_stop = async move { stopped.await.unwrap() };
+            let server = tokio::spawn(serve(listener, config(dir), told_to_stop));
+            Self { base, stop, server }
+        }
+
+        async fn stop_within(self, limit: Duration) {
+            self.stop.send(()).unwrap();
+            timeout(limit, self.server).await.unwrap().unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_subscriber_is_woken_however_the_tenant_gets_its_database() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let first = Stoppable::start(elsewhere.path()).await;
+        define_clients(&first.base, "acme").await;
+        first.stop_within(Duration::from_secs(2)).await;
+
+        let (base, dir) = start().await;
+        let feed = subscribe(of(&base, "acme/subscribe")).await;
+        std::fs::copy(elsewhere.path().join("acme.db"), dir.path().join("acme.db")).unwrap();
+        let (status, _) = call("GET", of(&base, "acme/describe"), SECRET, Value::Null).await;
+        assert_eq!(status, 200);
+        insert_clients(&base, "acme", 1).await;
+        let (seqs, _feed) = next_seqs(feed, 2).await;
+        assert_eq!(seqs, [1, 2]);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn shutting_down_ends_the_feeds_and_stops_serving() {
         let dir = tempfile::tempdir().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let (stop, stopped) = oneshot::channel::<()>();
-        let told_to_stop = async move { stopped.await.unwrap() };
-        let server = tokio::spawn(serve(listener, config(dir.path()), told_to_stop));
+        let running = Stoppable::start(dir.path()).await;
+        let base = running.base.clone();
         define_clients(&base, "acme").await;
         let feed = subscribe(of(&base, "acme/subscribe")).await;
         let waiting = subscribe(of(&base, "nobody/subscribe")).await;
 
-        stop.send(()).unwrap();
-        timeout(Duration::from_secs(2), server)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        running.stop_within(Duration::from_secs(2)).await;
         assert_eq!(next_events(feed, 1).await.0, []);
         assert_eq!(next_events(waiting, 1).await.0, []);
         assert_eq!(open_databases(dir.path()), 0);
@@ -817,12 +882,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn shutting_down_does_not_wait_forever_for_a_stuck_request() {
         let dir = tempfile::tempdir().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (stop, stopped) = oneshot::channel::<()>();
-        let told_to_stop = async move { stopped.await.unwrap() };
-        let server = tokio::spawn(serve(listener, config(dir.path()), told_to_stop));
-        let mut stuck = TcpStream::connect(address).unwrap();
+        let running = Stoppable::start(dir.path()).await;
+        let mut stuck = TcpStream::connect(running.base.trim_start_matches("http://")).unwrap();
         stuck
             .write_all(
                 b"POST /v1/tenants/acme/migrate HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n",
@@ -830,12 +891,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        stop.send(()).unwrap();
-        timeout(Duration::from_secs(8), server)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        running.stop_within(Duration::from_secs(8)).await;
         drop(stuck);
     }
 

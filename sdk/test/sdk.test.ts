@@ -247,6 +247,22 @@ describe("subscribe", () => {
     expect(events).toEqual(["gap", "change 10002"]);
   });
 
+  test("a subscriber ahead of the log, as after a restore from backup, is told too", async () => {
+    const db = await crm();
+    const events: string[] = [];
+    const stopWatching = db.subscribe((change) => events.push(`change ${change.seq}`), {
+      since: 500,
+      onGap: () => events.push("gap"),
+      onError: (error) => events.push(`error ${String(error)}`),
+    });
+    await until(() => events.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await db.insert("clients", { name: "Acme" });
+    await until(() => events.length === 2);
+    stopWatching();
+    expect(events).toEqual(["gap", "change 2"]);
+  });
+
   test("subscribing to a long change log starts with the next write", async () => {
     const db = await crm();
     await insertClients(db, 10_000);
