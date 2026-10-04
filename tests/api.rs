@@ -112,11 +112,19 @@ mod tests {
     #[test]
     fn typo_in_table_name_suggests_the_real_table() {
         let db = crm();
-        let text = message(db.get("client", 1));
+        let unknown =
+            "unknown table `client`. Did you mean `clients`? Existing tables: clients, companies.";
+        assert_eq!(message(db.get("client", 1)), unknown);
+        assert_eq!(message(db.find(&Query::table("client"))), unknown);
         assert_eq!(
-            text,
-            "unknown table `client`. Did you mean `clients`? Existing tables: clients, companies."
+            message(db.insert("client", json!({"name": "Acme"}))),
+            unknown
         );
+        assert_eq!(
+            message(db.update("client", 1, json!({"name": "Acme"}), None)),
+            unknown
+        );
+        assert_eq!(message(db.delete("client", 1, None)), unknown);
     }
 
     #[test]

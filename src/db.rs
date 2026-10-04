@@ -522,15 +522,19 @@ pub(crate) fn load_def(conn: &Connection, table: &str) -> Result<TableDef> {
             |row| row.get(0),
         )
         .optional()?;
-    if let Some(schema) = schema {
-        return from_json(&schema);
+    match schema {
+        Some(schema) => from_json(&schema),
+        None => Err(unknown_table(table, &all_defs(conn)?)),
     }
-    let available: Vec<String> = all_defs(conn)?.into_iter().map(|def| def.name).collect();
-    Err(DbError::UnknownTable {
+}
+
+pub(crate) fn unknown_table(table: &str, defs: &[TableDef]) -> DbError {
+    let available: Vec<String> = defs.iter().map(|def| def.name.clone()).collect();
+    DbError::UnknownTable {
         table: table.to_owned(),
         suggestion: closest(table, &available),
         available,
-    })
+    }
 }
 
 pub(crate) fn store_def(conn: &Connection, def: &TableDef) -> Result<()> {

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::change::{Change, ChangeKind};
-use crate::db::{AgentDb, Doc, all_defs, doc_exists, load_def, read_doc, record, to_json};
+use crate::db::{AgentDb, Doc, all_defs, doc_exists, read_doc, record, to_json, unknown_table};
 use crate::error::{DbError, Result};
 use crate::index;
 use crate::query::sql_value;
@@ -63,11 +63,12 @@ impl AgentDb {
             });
         }
         let changes = self.write(|conn, at| {
+            let defs = all_defs(conn)?;
             writes
                 .into_iter()
                 .enumerate()
                 .map(|(index, write)| {
-                    apply(conn, write, at).map_err(|source| source.at_step(index + 1, of))
+                    apply(conn, &defs, write, at).map_err(|source| source.at_step(index + 1, of))
                 })
                 .collect()
         })?;
@@ -133,25 +134,35 @@ impl AgentDb {
     }
 }
 
-fn apply(conn: &Connection, write: Write, at: &str) -> Result<Change> {
+/// Applies one write of a batch. `defs` is every table as it was when the
+/// batch began; no write changes a table's definition.
+fn apply(conn: &Connection, defs: &[TableDef], write: Write, at: &str) -> Result<Change> {
     match write {
-        Write::Insert { table, doc } => insert(conn, &table, doc, at),
+        Write::Insert { table, doc } => insert(conn, find_def(defs, &table)?, doc, at),
         Write::Update {
             table,
             id,
             patch,
             version,
-        } => update(conn, &table, id, version, patch, at),
-        Write::Delete { table, id, version } => delete(conn, &table, id, version, at),
+        } => update(conn, find_def(defs, &table)?, id, version, patch, at),
+        Write::Delete { table, id, version } => {
+            delete(conn, defs, find_def(defs, &table)?, id, version, at)
+        }
     }
 }
 
-fn insert(conn: &Connection, table: &str, doc: Value, at: &str) -> Result<Change> {
-    let def = load_def(conn, table)?;
+fn find_def<'a>(defs: &'a [TableDef], table: &str) -> Result<&'a TableDef> {
+    defs.iter()
+        .find(|def| def.name == table)
+        .ok_or_else(|| unknown_table(table, defs))
+}
+
+fn insert(conn: &Connection, def: &TableDef, doc: Value, at: &str) -> Result<Change> {
+    let table = def.name.as_str();
     let mut fields = def.check(into_object(doc)?)?;
     fields.retain(|_, value| !value.is_null());
     def.check_required(&fields)?;
-    check_references(conn, &def, &fields)?;
+    check_references(conn, def, &fields)?;
     let id: i64 = conn.query_row(
         "INSERT INTO _ids (name, next_id) VALUES (?1, 2)
          ON CONFLICT (name) DO UPDATE SET next_id = next_id + 1
@@ -159,7 +170,7 @@ fn insert(conn: &Connection, table: &str, doc: Value, at: &str) -> Result<Change
         [table],
         |row| row.get(0),
     )?;
-    check_unique(conn, &def, &fields, id)?;
+    check_unique(conn, def, &fields, id)?;
     add_to_count(conn, table, 1)?;
     let doc = Doc {
         id,
@@ -178,13 +189,13 @@ fn insert(conn: &Connection, table: &str, doc: Value, at: &str) -> Result<Change
 
 fn update(
     conn: &Connection,
-    table: &str,
+    def: &TableDef,
     id: i64,
     expected_version: Option<i64>,
     patch: Value,
     at: &str,
 ) -> Result<Change> {
-    let def = load_def(conn, table)?;
+    let table = def.name.as_str();
     let current = read_doc(conn, table, id)?;
     check_version(table, &current, expected_version)?;
     let mut fields = current.fields;
@@ -196,8 +207,8 @@ fn update(
         }
     }
     def.check_required(&fields)?;
-    check_references(conn, &def, &fields)?;
-    check_unique(conn, &def, &fields, id)?;
+    check_references(conn, def, &fields)?;
+    check_unique(conn, def, &fields, id)?;
     let doc = Doc {
         id,
         version: current.version + 1,
@@ -214,15 +225,16 @@ fn update(
 
 fn delete(
     conn: &Connection,
-    table: &str,
+    defs: &[TableDef],
+    def: &TableDef,
     id: i64,
     expected_version: Option<i64>,
     at: &str,
 ) -> Result<Change> {
-    load_def(conn, table)?;
+    let table = def.name.as_str();
     let doc = read_doc(conn, table, id)?;
     check_version(table, &doc, expected_version)?;
-    check_not_referenced(conn, table, id)?;
+    check_not_referenced(conn, defs, table, id)?;
     conn.execute(
         "DELETE FROM docs WHERE tbl = ?1 AND id = ?2",
         params![table, id],
@@ -286,11 +298,11 @@ fn check_unique(
     Ok(())
 }
 
-fn check_not_referenced(conn: &Connection, table: &str, id: i64) -> Result<()> {
-    for def in all_defs(conn)? {
+fn check_not_referenced(conn: &Connection, defs: &[TableDef], table: &str, id: i64) -> Result<()> {
+    for def in defs {
         for field in def.fields.iter().filter(|field| field.links_to(table)) {
             let count: i64 =
-                conn.query_row(&index::count_holders_sql(&def, field), [id], |row| {
+                conn.query_row(&index::count_holders_sql(def, field), [id], |row| {
                     row.get(0)
                 })?;
             if count > 0 {
