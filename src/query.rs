@@ -161,7 +161,7 @@ impl Query {
             let (clause, param) = compile_filter(def, filter, &column)?;
             conditions = format!("{conditions} AND {clause}");
             params.extend(param);
-            narrowing.extend(column.narrowing(filter.op));
+            narrowing.extend(column.narrowing(filter));
         }
         let sorted_by = column(def, self.sort.as_ref().map_or("id", |sort| &sort.field))?;
         let narrowest = narrowing
@@ -284,14 +284,15 @@ impl Column {
         }
     }
 
-    /// The index that answers a filter with `op` on this column, and how
-    /// far it narrows the search: the lower, the fewer documents are left.
-    fn narrowing(&self, op: Op) -> Option<(u8, String)> {
+    /// The index that answers `filter` on this column, and how far it
+    /// narrows the search: the lower, the fewer documents are left.
+    fn narrowing(&self, filter: &Filter) -> Option<(u8, String)> {
         let index = self.index.clone()?;
-        let precision = match op {
+        let precision = match filter.op {
+            Op::Eq if filter.value.is_null() => 2,
             Op::Eq if self.unique => 0,
             Op::Eq => 1,
-            _ if op.can_use_index() => 2,
+            op if op.can_use_index() => 2,
             _ => return None,
         };
         Some((precision, index))

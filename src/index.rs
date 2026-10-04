@@ -93,6 +93,7 @@ pub(crate) fn sync(conn: &Connection) -> Result<()> {
 mod tests {
     use rusqlite::types::Value as SqlValue;
     use rusqlite::{Connection, params_from_iter};
+    use serde_json::Value;
 
     use super::{count_holders_sql, other_holder_sql};
     use crate::db::load_def;
@@ -217,6 +218,16 @@ mod tests {
         assert_eq!(
             page,
             ["SEARCH docs USING INDEX field.clients.email (<expr>=?)"]
+        );
+
+        let without_email =
+            clients()
+                .filter("email", Op::Eq, Value::Null)
+                .filter("status", Op::Eq, "lead");
+        let (_, page) = plans(&crm(), &without_email);
+        assert_eq!(
+            page,
+            ["SEARCH docs USING INDEX field.clients.status (<expr>=?)"]
         );
     }
 
