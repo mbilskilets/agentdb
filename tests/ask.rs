@@ -35,17 +35,8 @@ mod tests {
     fn sure_no(question: &Question) -> Answer {
         match question {
             Question::Noul { .. } => Answer::Noul { noul: 0.0 },
-            Question::Choice { criteria, .. } => {
-                let none = if criteria.contains_key(NONE) {
-                    NONE
-                } else {
-                    "none"
-                };
-                Answer::Choice {
-                    choice: none.to_owned(),
-                    confidence: 1.0,
-                }
-            }
+            Question::Choice { criteria, .. } if criteria.contains_key(NONE) => sure(NONE, 1.0),
+            Question::Choice { .. } => sure("none", 1.0),
         }
     }
 
@@ -85,11 +76,14 @@ mod tests {
     }
 
     fn pick(id: &str, choice: &str) -> (String, Answer) {
-        let answer = Answer::Choice {
+        (id.to_owned(), sure(choice, 0.95))
+    }
+
+    fn sure(choice: &str, confidence: f64) -> Answer {
+        Answer::Choice {
             choice: choice.to_owned(),
-            confidence: 0.95,
-        };
-        (id.to_owned(), answer)
+            confidence,
+        }
     }
 
     fn noul(id: &str, probability: f64) -> (String, Answer) {
@@ -385,13 +379,9 @@ mod tests {
 
     #[test]
     fn an_unsure_answer_returns_the_guess_without_running_it() {
-        let unsure = Answer::Choice {
-            choice: "is lead".to_owned(),
-            confidence: 0.4,
-        };
         let judge = canned([
             pick("table", "clients"),
-            ("clients/field.status".to_owned(), unsure),
+            ("clients/field.status".to_owned(), sure("is lead", 0.4)),
         ]);
         let asked = crm().ask(&judge, "leads").unwrap();
         assert_eq!(asked.page, None);
@@ -434,8 +424,11 @@ mod tests {
             ("write", Answer::Other),
             ("clients/field.status", Answer::Other),
             ("clients/field.status", Answer::Noul { noul: 0.9 }),
-            ("clients/field.status", pick("", "is churned").1),
-            ("sort", pick("", "revenue").1),
+            ("clients/field.status", sure("is churned", 0.95)),
+            ("clients/field.status", sure("is lead", f64::NAN)),
+            ("clients/field.status", sure("is lead", 1.5)),
+            ("sort", sure("revenue", 0.95)),
+            ("sort", Answer::Noul { noul: -0.5 }),
             ("leftover", Answer::Other),
         ];
         for (id, answer) in unusable {
