@@ -82,6 +82,97 @@ mod tests {
         ));
     }
 
+    const STORED_AT: &str = "2026-10-01T08:00:00Z";
+    const MIGRATED_AT: &str = "2026-10-02T08:00:00Z";
+
+    /// A table with a field of every type and three documents stored at
+    /// [`STORED_AT`]: one sets every field, one sets the values a careless
+    /// rewrite would change (`2.5`, `false`, an empty text), one sets none.
+    fn every_field_type() -> AgentDb {
+        let db = AgentDb::open_in_memory().unwrap();
+        db.define_table(&TableDef::new("teams").required("name", FieldType::Text))
+            .unwrap();
+        db.define_table(
+            &TableDef::new("tasks")
+                .optional("title", FieldType::Text)
+                .optional("points", FieldType::Number)
+                .optional("done", FieldType::Bool)
+                .optional("due", FieldType::Datetime)
+                .optional(
+                    "stage",
+                    FieldType::Enum {
+                        values: vec!["open".to_owned(), "won".to_owned()],
+                    },
+                )
+                .optional(
+                    "team",
+                    FieldType::Ref {
+                        table: "teams".to_owned(),
+                    },
+                ),
+        )
+        .unwrap();
+        db.freeze_time(Some(STORED_AT)).unwrap();
+        db.insert("teams", json!({"name": "Sales"})).unwrap();
+        db.insert(
+            "tasks",
+            json!({"title": "Say \"hi\" to Łódź\n🙂", "points": 3, "done": true,
+                   "due": "2026-10-03", "stage": "won", "team": 1}),
+        )
+        .unwrap();
+        db.insert("tasks", json!({"title": "", "points": 2.5, "done": false}))
+            .unwrap();
+        db.insert("tasks", json!({})).unwrap();
+        db.freeze_time(Some(MIGRATED_AT)).unwrap();
+        db
+    }
+
+    fn tasks(db: &AgentDb) -> serde_json::Value {
+        serde_json::to_value(db.find(&Query::table("tasks")).unwrap().docs).unwrap()
+    }
+
+    #[test]
+    fn renaming_a_field_keeps_every_value_exactly_as_it_was_stored() {
+        let db = every_field_type();
+        for field in ["title", "points", "done", "due", "stage", "team"] {
+            db.rename_field("tasks", field, &format!("new_{field}"))
+                .unwrap();
+        }
+        assert_eq!(
+            tasks(&db),
+            json!([
+                {"id": 1, "version": 1, "created_at": STORED_AT, "updated_at": STORED_AT,
+                 "new_title": "Say \"hi\" to Łódź\n🙂", "new_points": 3, "new_done": true,
+                 "new_due": "2026-10-03T00:00:00Z", "new_stage": "won", "new_team": 1},
+                {"id": 2, "version": 1, "created_at": STORED_AT, "updated_at": STORED_AT,
+                 "new_title": "", "new_points": 2.5, "new_done": false},
+                {"id": 3, "version": 1, "created_at": STORED_AT, "updated_at": STORED_AT},
+            ])
+        );
+    }
+
+    #[test]
+    fn removing_a_field_leaves_every_other_value_exactly_as_it_was_stored() {
+        let db = every_field_type();
+        db.remove_field("tasks", "title", true).unwrap();
+        db.remove_field("tasks", "stage", true).unwrap();
+        assert_eq!(
+            tasks(&db),
+            json!([
+                {"id": 1, "version": 1, "created_at": STORED_AT, "updated_at": STORED_AT,
+                 "points": 3, "done": true, "due": "2026-10-03T00:00:00Z", "team": 1},
+                {"id": 2, "version": 1, "created_at": STORED_AT, "updated_at": STORED_AT,
+                 "points": 2.5, "done": false},
+                {"id": 3, "version": 1, "created_at": STORED_AT, "updated_at": STORED_AT},
+            ])
+        );
+        for field in ["points", "done", "due", "team"] {
+            db.remove_field("tasks", field, true).unwrap();
+        }
+        let left: Vec<_> = db.find(&Query::table("tasks")).unwrap().docs;
+        assert!(left.iter().all(|task| task.fields.is_empty()));
+    }
+
     #[test]
     fn renaming_a_table_keeps_documents_and_links() {
         let db = crm();
@@ -578,6 +669,66 @@ mod tests {
             db.delete("companies", 1, None),
             Err(DbError::StillReferenced { .. })
         ));
+    }
+
+    /// More documents than a type change converts at a time, so the change
+    /// has to carry on from where the last batch of values ended.
+    fn readings() -> AgentDb {
+        let db = AgentDb::open_in_memory().unwrap();
+        db.define_table(&TableDef::new("readings").optional("level", FieldType::Text))
+            .unwrap();
+        let writes: Vec<Write> = (1..=1201)
+            .map(|id| {
+                let level = match id {
+                    7 => json!(null),
+                    1100 => json!("n/a"),
+                    1150 => json!("?"),
+                    id => json!(id.to_string()),
+                };
+                Write::Insert {
+                    table: "readings".to_owned(),
+                    doc: json!({"level": level}),
+                }
+            })
+            .collect();
+        for batch in writes.chunks(500) {
+            db.batch(batch.to_vec()).unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn a_type_change_converts_a_large_table_or_none_of_it() {
+        let db = readings();
+        db.freeze_time(Some(MIGRATED_AT)).unwrap();
+        assert_eq!(
+            message(db.change_field_type("readings", "level", FieldType::Number)),
+            "cannot change `level` on `readings` to number: 2 document(s) hold a value that does not fit, for example id 1100 with \"n/a\". Fix those values first; nothing was changed."
+        );
+        for id in [1, 500, 501, 1201] {
+            assert_eq!(
+                db.get("readings", id).unwrap().fields["level"],
+                id.to_string()
+            );
+        }
+
+        db.update("readings", 1100, json!({"level": "1100"}), None)
+            .unwrap();
+        db.update("readings", 1150, json!({"level": "11.5"}), None)
+            .unwrap();
+        let before = db.get("readings", 501).unwrap();
+        db.change_field_type("readings", "level", FieldType::Number)
+            .unwrap();
+        for id in [1, 500, 501, 1000, 1001, 1100, 1201] {
+            assert_eq!(db.get("readings", id).unwrap().fields["level"], json!(id));
+        }
+        assert_eq!(db.get("readings", 1150).unwrap().fields["level"], 11.5);
+        assert_eq!(db.get("readings", 7).unwrap().fields.get("level"), None);
+        let after = db.get("readings", 501).unwrap();
+        assert_eq!(
+            (after.version, after.updated_at),
+            (before.version, before.updated_at)
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Number, Value};
+use serde_json::{Number, Value};
 
 use crate::change::ChangeKind;
 use crate::db::{
@@ -15,6 +15,9 @@ use crate::db::{
 use crate::error::{DbError, Result};
 use crate::index;
 use crate::schema::{Field, FieldType, TableDef, check_enum_value, check_name, validate_field};
+
+/// How many values a type change holds in memory at a time.
+const CONVERTED_AT_ONCE: i64 = 500;
 
 /// One change to the schema. Pass several to [`AgentDb::migrate`] to apply
 /// them as a unit.
@@ -422,12 +425,11 @@ fn rename_field(conn: &Connection, table: &str, field: &str, new_name: &str) -> 
     new_name.clone_into(&mut target.name);
     validate_field(target)?;
     save_def(conn, &mut def)?;
-    for (id, mut fields) in load_rows(conn, table)? {
-        if let Some(value) = fields.remove(field) {
-            fields.insert(new_name.to_owned(), value);
-            store_row(conn, table, id, &fields)?;
-        }
-    }
+    conn.execute(
+        "UPDATE docs SET body = json_set(json_remove(body, ?2), ?3, body -> ?2)
+         WHERE tbl = ?1 AND json_type(body, ?2) IS NOT NULL",
+        params![table, json_path(field), json_path(new_name)],
+    )?;
     Ok(())
 }
 
@@ -439,31 +441,68 @@ fn change_type(conn: &Connection, table: &str, field: &str, to: &FieldType) -> R
     validate_field(target)?;
     let unique = target.unique;
     save_def(conn, &mut def)?;
-    let mut misfits: Vec<(i64, Value)> = Vec::new();
-    for (id, mut fields) in load_rows(conn, table)? {
-        let Some(value) = fields.get(field).cloned() else {
-            continue;
+    let mut misfits = 0;
+    let mut first_misfit = None;
+    let mut converted_up_to = 0;
+    loop {
+        let values = values_after(conn, table, field, converted_up_to)?;
+        let Some((last_id, _)) = values.last() else {
+            break;
         };
-        match convert(conn, table, field, to, &value)? {
-            Some(converted) => {
-                fields.insert(field.to_owned(), converted);
-                store_row(conn, table, id, &fields)?;
+        converted_up_to = *last_id;
+        for (id, value) in values {
+            if let Some(converted) = convert(conn, table, field, to, &value)? {
+                store_value(conn, table, field, id, &converted)?;
+            } else {
+                misfits += 1;
+                first_misfit.get_or_insert((id, value));
             }
-            None => misfits.push((id, value)),
         }
     }
-    match misfits.first() {
+    match first_misfit {
         None if unique => check_no_duplicates(conn, table, field),
         None => Ok(()),
         Some((example_id, example)) => Err(DbError::CannotConvert {
             table: table.to_owned(),
             field: field.to_owned(),
             to: to.describe(),
-            count: misfits.len(),
-            example_id: *example_id,
+            count: misfits,
+            example_id,
             example: example.to_string(),
         }),
     }
+}
+
+/// The next values of `field` in id order, from the documents after the one
+/// with id `after` that hold one.
+fn values_after(
+    conn: &Connection,
+    table: &str,
+    field: &str,
+    after: i64,
+) -> Result<Vec<(i64, Value)>> {
+    conn.prepare(
+        "SELECT id, body -> ?2 FROM docs
+         WHERE tbl = ?1 AND id > ?3 AND json_type(body, ?2) IS NOT NULL
+         ORDER BY id LIMIT ?4",
+    )?
+    .query_map(
+        params![table, json_path(field), after, CONVERTED_AT_ONCE],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    )?
+    .map(|row| {
+        let (id, value) = row?;
+        Ok((id, from_json(&value)?))
+    })
+    .collect()
+}
+
+fn store_value(conn: &Connection, table: &str, field: &str, id: i64, value: &Value) -> Result<()> {
+    conn.execute(
+        "UPDATE docs SET body = json_set(body, ?3, json(?4)) WHERE tbl = ?1 AND id = ?2",
+        params![table, id, json_path(field), to_json(value)?],
+    )?;
+    Ok(())
 }
 
 /// The value as the new type would store it, or `None` when it does not fit.
@@ -653,11 +692,11 @@ fn remove_field(conn: &Connection, table: &str, field: &str, force: bool) -> Res
     }
     def.fields.retain(|existing| existing.name != field);
     save_def(conn, &mut def)?;
-    for (id, mut fields) in load_rows(conn, table)? {
-        if fields.remove(field).is_some() {
-            store_row(conn, table, id, &fields)?;
-        }
-    }
+    conn.execute(
+        "UPDATE docs SET body = json_remove(body, ?2)
+         WHERE tbl = ?1 AND json_type(body, ?2) IS NOT NULL",
+        params![table, json_path(field)],
+    )?;
     Ok(())
 }
 
@@ -728,22 +767,8 @@ fn count_set(conn: &Connection, table: &str, field: &str) -> Result<i64> {
     )?)
 }
 
-fn load_rows(conn: &Connection, table: &str) -> Result<Vec<(i64, Map<String, Value>)>> {
-    conn.prepare("SELECT id, body FROM docs WHERE tbl = ?1")?
-        .query_map([table], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?
-        .map(|row| {
-            let (id, body) = row?;
-            Ok((id, from_json(&body)?))
-        })
-        .collect()
-}
-
-fn store_row(conn: &Connection, table: &str, id: i64, fields: &Map<String, Value>) -> Result<()> {
-    conn.execute(
-        "UPDATE docs SET body = ?3 WHERE tbl = ?1 AND id = ?2",
-        params![table, id, to_json(fields)?],
-    )?;
-    Ok(())
+/// Where SQLite's JSON functions find `field` in a document. Field names
+/// hold only lowercase letters, digits and underscores, so none needs quoting.
+fn json_path(field: &str) -> String {
+    format!("$.{field}")
 }
