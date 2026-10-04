@@ -1,35 +1,43 @@
 //! The HTTP server: one process serving many tenants, each with its own
 //! encrypted database file.
 
-use std::collections::HashMap;
-use std::convert::Infallible;
-use std::fmt::Write;
+mod error;
+mod subscribe;
+mod tenants;
+
+use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query as UrlQuery, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query as UrlQuery, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use hmac::{Hmac, KeyInit, Mac};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use tokio::sync::{broadcast, mpsc};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::task::spawn_blocking;
-use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::{Stream, StreamExt};
 
-use crate::{AgentDb, Change, DbError, Jev, Query, SchemaChange};
+use self::error::ApiError;
+use self::subscribe::subscribe;
+use self::tenants::{Missing, Tenants};
+use crate::{AgentDb, Asked, Change, DbError, Doc, Jev, Page, Query, SchemaChange, Write};
 
-const MAX_TENANT_LEN: usize = 64;
-const SUBSCRIBER_BUFFER: usize = 256;
+/// A shorter secret or master key is refused at startup: it could be guessed.
+const MIN_SECRET_LEN: usize = 32;
+const DEFAULT_MAX_OPEN_TENANTS: usize = 100;
+const MAX_BODY_MIB: usize = 8;
+/// Room for a batch of 500 writes of 16 KiB each.
+const MAX_BODY_BYTES: usize = MAX_BODY_MIB * 1024 * 1024;
+/// How long requests in flight get to finish once the server is told to stop.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -40,172 +48,117 @@ pub struct Config {
     pub master_key: String,
     /// Where tenant files live, one `<tenant>.db` each.
     pub data_dir: PathBuf,
+    /// How many tenant databases may be open at once. Each one holds five
+    /// file descriptors, so keep this well under the process's limit.
+    pub max_open_tenants: usize,
     /// Needed only for `ask`.
     pub jev: Option<Jev>,
 }
 
 impl Config {
     /// Reads `AGENTDB_SECRET`, `AGENTDB_MASTER_KEY`, `AGENTDB_DATA_DIR`
-    /// (default `./data`) and `TYPESAFE_API_KEY` (optional).
+    /// (default `./data`), `AGENTDB_MAX_OPEN_TENANTS` (default 100) and
+    /// `TYPESAFE_API_KEY` (optional).
     ///
     /// # Errors
-    /// Names the variable that is missing.
+    /// Names the variable that is missing or unusable, never its value.
     pub fn from_env() -> Result<Self, String> {
-        let required = |name: &str| match std::env::var(name) {
-            Ok(value) if !value.is_empty() => Ok(value),
-            _ => Err(format!("the {name} environment variable must be set")),
+        let secret = secret_from_env("AGENTDB_SECRET")?;
+        let master_key = secret_from_env("AGENTDB_MASTER_KEY")?;
+        if secret == master_key {
+            return Err("AGENTDB_SECRET and AGENTDB_MASTER_KEY must be two different values: every client holds the secret, and only the server may hold the key that encrypts the files".to_owned());
+        }
+        let max_open_tenants = match std::env::var("AGENTDB_MAX_OPEN_TENANTS") {
+            Ok(text) => text
+                .parse()
+                .ok()
+                .filter(|max| *max > 0)
+                .ok_or("AGENTDB_MAX_OPEN_TENANTS must be a whole number above 0")?,
+            Err(_) => DEFAULT_MAX_OPEN_TENANTS,
         };
         Ok(Self {
-            secret: required("AGENTDB_SECRET")?,
-            master_key: required("AGENTDB_MASTER_KEY")?,
+            secret,
+            master_key,
             data_dir: std::env::var("AGENTDB_DATA_DIR")
                 .unwrap_or_else(|_| "data".to_owned())
                 .into(),
+            max_open_tenants,
             jev: Jev::from_env().ok(),
         })
     }
 }
 
+fn secret_from_env(name: &str) -> Result<String, String> {
+    match std::env::var(name) {
+        Ok(value) if value.len() >= MIN_SECRET_LEN => Ok(value),
+        _ => Err(format!(
+            "the {name} environment variable must be set to at least {MIN_SECRET_LEN} characters. Generate one with: openssl rand -hex 32"
+        )),
+    }
+}
+
 struct App {
-    config: Config,
-    /// Tenant databases stay open: opening one costs far more than a query.
-    tenants: Mutex<HashMap<String, Arc<AgentDb>>>,
+    secret: String,
+    jev: Option<Jev>,
+    tenants: Tenants,
+    stopping: watch::Receiver<bool>,
 }
 
 impl App {
-    fn tenant(&self, id: &str) -> Result<Arc<AgentDb>, ApiError> {
-        let valid = !id.is_empty()
-            && id.len() <= MAX_TENANT_LEN
-            && id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-        if !valid {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "invalid_tenant",
-                format!(
-                    "invalid tenant id `{id}`. Use 1 to {MAX_TENANT_LEN} letters, digits, `_` or `-`."
-                ),
-            ));
-        }
-        let mut tenants = self.tenants.lock().map_err(ApiError::internal)?;
-        if let Some(db) = tenants.get(id) {
-            return Ok(Arc::clone(db));
-        }
-        std::fs::create_dir_all(&self.config.data_dir).map_err(ApiError::internal)?;
-        let path = self.config.data_dir.join(format!("{id}.db"));
-        let db = Arc::new(AgentDb::open(path, &self.tenant_key(id)?)?);
-        tenants.insert(id.to_owned(), Arc::clone(&db));
-        Ok(db)
-    }
-
-    /// A raw 256-bit key, unique per tenant. Raw keys skip the slow
-    /// passphrase stretching, which a random key does not need.
-    fn tenant_key(&self, id: &str) -> Result<String, ApiError> {
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.config.master_key.as_bytes())
-            .map_err(ApiError::internal)?;
-        mac.update(b"agentdb-tenant:");
-        mac.update(id.as_bytes());
-        let mut hex = String::new();
-        for byte in mac.finalize().into_bytes() {
-            write!(hex, "{byte:02x}").map_err(ApiError::internal)?;
-        }
-        Ok(format!("x'{hex}'"))
-    }
-}
-
-/// An error as the caller sees it: `{"error": {"code": ..., "message": ...}}`.
-#[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
-}
-
-impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            code,
-            message: message.into(),
-        }
-    }
-
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "used as a map_err callback, which hands over the error by value"
-    )]
-    fn internal(error: impl ToString) -> Self {
-        Self::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            error.to_string(),
-        )
-    }
-}
-
-impl From<DbError> for ApiError {
-    fn from(error: DbError) -> Self {
-        let code = error.code();
-        let status = match code {
-            "not_found" | "unknown_table" => StatusCode::NOT_FOUND,
-            "version_conflict" | "still_referenced" | "table_exists" | "field_exists"
-            | "table_referenced" | "enum_value_in_use" | "would_destroy" => StatusCode::CONFLICT,
-            "missing_api_key" => StatusCode::SERVICE_UNAVAILABLE,
-            "model_unavailable" => StatusCode::BAD_GATEWAY,
-            "storage" | "internal" | "newer_format" | "wrong_key" | "empty_key" => {
-                StatusCode::INTERNAL_SERVER_ERROR
+    /// Completes once the server has been told to stop.
+    async fn shutting_down(&self) {
+        let mut stopping = self.stopping.clone();
+        while !*stopping.borrow_and_update() {
+            if stopping.changed().await.is_err() {
+                return;
             }
-            _ => StatusCode::BAD_REQUEST,
-        };
-        Self::new(status, code, error.to_string())
+        }
+    }
+
+    async fn grace_ran_out(&self) {
+        self.shutting_down().await;
+        tokio::time::sleep(SHUTDOWN_GRACE).await;
     }
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let body = json!({"error": {"code": self.code, "message": self.message}});
-        (self.status, Json(body)).into_response()
-    }
-}
-
-type Api<T> = Result<Json<T>, ApiError>;
-
-/// Runs database work for one tenant off the async threads.
-async fn with_tenant<T, F>(app: Arc<App>, tenant: String, work: F) -> Api<T>
-where
-    T: Send + 'static,
-    F: FnOnce(&AgentDb, &App) -> Result<T, DbError> + Send + 'static,
-{
-    spawn_blocking(move || {
-        let db = app.tenant(&tenant)?;
-        Ok(Json(work(&db, &app)?))
-    })
-    .await
-    .map_err(ApiError::internal)?
-}
-
-fn parse<T: DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
-    serde_json::from_slice(body).map_err(|error| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            format!("the request body is not valid: {error}."),
-        )
-    })
-}
-
-/// Builds the server's routes.
-pub fn router(config: Config) -> Router {
+/// Serves `config` on `listener` until `shutdown` completes. The server
+/// then stops accepting connections, ends every change feed, gives the
+/// requests in flight five seconds to finish and closes the tenant
+/// databases.
+///
+/// # Errors
+/// Fails when the listener stops accepting connections.
+pub async fn serve(
+    listener: TcpListener,
+    config: Config,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> io::Result<()> {
+    let (stop, stopping) = watch::channel(false);
     let app = Arc::new(App {
-        config,
-        tenants: Mutex::new(HashMap::new()),
+        secret: config.secret,
+        jev: config.jev,
+        tenants: Tenants::new(config.data_dir, config.master_key, config.max_open_tenants),
+        stopping,
     });
+    let serving = axum::serve(listener, router(&app)).with_graceful_shutdown(async move {
+        shutdown.await;
+        stop.send_replace(true);
+    });
+    tokio::select! {
+        served = serving.into_future() => served?,
+        () = app.grace_ran_out() => {}
+    }
+    app.tenants.close();
+    Ok(())
+}
+
+fn router(app: &Arc<App>) -> Router {
     let tenant_routes = Router::new()
         .route("/describe", get(describe))
         .route("/migrate", post(migrate))
         .route("/find", post(find))
         .route("/ask", post(ask))
+        .route("/batch", post(batch))
         .route("/changes", get(changes))
         .route("/subscribe", get(subscribe))
         .route("/tables/{table}/docs", post(insert))
@@ -213,11 +166,12 @@ pub fn router(config: Config) -> Router {
             "/tables/{table}/docs/{id}",
             get(get_doc).patch(update).delete(delete),
         )
-        .route_layer(middleware::from_fn_with_state(Arc::clone(&app), authorize));
+        .route_layer(middleware::from_fn_with_state(Arc::clone(app), authorize));
     Router::new()
         .route("/health", get(|| async { Json(json!({"ok": true})) }))
         .nest("/v1/tenants/{tenant}", tenant_routes)
-        .with_state(app)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(Arc::clone(app))
 }
 
 async fn authorize(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
@@ -227,7 +181,7 @@ async fn authorize(State(app): State<Arc<App>>, request: Request, next: Next) ->
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .unwrap_or_default();
-    let matches: bool = sent.as_bytes().ct_eq(app.config.secret.as_bytes()).into();
+    let matches: bool = sent.as_bytes().ct_eq(app.secret.as_bytes()).into();
     if matches {
         next.run(request).await
     } else {
@@ -240,8 +194,75 @@ async fn authorize(State(app): State<Arc<App>>, request: Request, next: Next) ->
     }
 }
 
+/// A JSON request body.
+struct Body<T>(T);
+
+impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, ApiError> {
+        let bytes = Bytes::from_request(request, state)
+            .await
+            .map_err(|rejection| {
+                if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    ApiError::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request_too_large",
+                        format!(
+                            "the request body is larger than the {MAX_BODY_MIB} MiB one request may carry. Send fewer writes per batch, or smaller documents."
+                        ),
+                    )
+                } else {
+                    invalid_request(&rejection.body_text())
+                }
+            })?;
+        serde_json::from_slice(&bytes)
+            .map(Self)
+            .map_err(|error| invalid_request(&error.to_string()))
+    }
+}
+
+fn invalid_request(reason: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        format!("the request body is not valid: {reason}."),
+    )
+}
+
+type Api<T> = Result<Json<T>, ApiError>;
+
+/// Runs work that touches a disk off the async threads.
+async fn blocking<T, F>(work: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+{
+    spawn_blocking(work).await.map_err(ApiError::internal)?
+}
+
+/// Runs database work for one tenant. A tenant that has no file and is not
+/// to get one is read as the empty database it would be.
+async fn with_tenant<T, F>(app: Arc<App>, tenant: String, missing: Missing, work: F) -> Api<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&AgentDb, &App) -> Result<T, DbError> + Send + 'static,
+{
+    blocking(move || {
+        let db = match app.tenants.open(&tenant, missing)? {
+            Some(db) => db,
+            None => Arc::new(AgentDb::open_in_memory()?),
+        };
+        Ok(Json(work(&db, &app)?))
+    })
+    .await
+}
+
 async fn describe(State(app): State<Arc<App>>, Path(tenant): Path<String>) -> Api<Value> {
-    with_tenant(app, tenant, |db, _| Ok(json!({"tables": db.describe()?}))).await
+    with_tenant(app, tenant, Missing::Skip, |db, _| {
+        Ok(json!({"tables": db.describe()?}))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -252,10 +273,9 @@ struct MigrateBody {
 async fn migrate(
     State(app): State<Arc<App>>,
     Path(tenant): Path<String>,
-    body: Bytes,
+    Body(body): Body<MigrateBody>,
 ) -> Api<Value> {
-    let body: MigrateBody = parse(&body)?;
-    with_tenant(app, tenant, move |db, _| {
+    with_tenant(app, tenant, Missing::Create, move |db, _| {
         db.migrate(&body.changes)?;
         Ok(json!({"tables": db.describe()?}))
     })
@@ -265,10 +285,9 @@ async fn migrate(
 async fn find(
     State(app): State<Arc<App>>,
     Path(tenant): Path<String>,
-    body: Bytes,
-) -> Api<crate::Page> {
-    let query: Query = parse(&body)?;
-    with_tenant(app, tenant, move |db, _| db.find(&query)).await
+    Body(query): Body<Query>,
+) -> Api<Page> {
+    with_tenant(app, tenant, Missing::Skip, move |db, _| db.find(&query)).await
 }
 
 #[derive(Deserialize)]
@@ -279,12 +298,34 @@ struct AskBody {
 async fn ask(
     State(app): State<Arc<App>>,
     Path(tenant): Path<String>,
-    body: Bytes,
-) -> Api<crate::Asked> {
-    let body: AskBody = parse(&body)?;
-    with_tenant(app, tenant, move |db, app| {
-        let jev = app.config.jev.as_ref().ok_or(DbError::MissingApiKey)?;
+    Body(body): Body<AskBody>,
+) -> Api<Asked> {
+    with_tenant(app, tenant, Missing::Skip, move |db, app| {
+        let jev = app.jev.as_ref().ok_or(DbError::MissingApiKey)?;
         db.ask(jev, &body.text)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct BatchBody {
+    writes: Vec<Write>,
+}
+
+#[derive(Serialize)]
+struct Docs {
+    docs: Vec<Doc>,
+}
+
+async fn batch(
+    State(app): State<Arc<App>>,
+    Path(tenant): Path<String>,
+    Body(body): Body<BatchBody>,
+) -> Api<Docs> {
+    with_tenant(app, tenant, Missing::Skip, move |db, _| {
+        Ok(Docs {
+            docs: db.batch(body.writes)?,
+        })
     })
     .await
 }
@@ -297,16 +338,19 @@ struct Since {
 #[derive(Serialize)]
 struct Changes {
     changes: Vec<Change>,
+    latest_seq: i64,
 }
 
 async fn changes(
     State(app): State<Arc<App>>,
     Path(tenant): Path<String>,
-    UrlQuery(since): UrlQuery<Since>,
+    UrlQuery(Since { since }): UrlQuery<Since>,
 ) -> Api<Changes> {
-    with_tenant(app, tenant, move |db, _| {
+    with_tenant(app, tenant, Missing::Skip, move |db, _| {
+        let changes = db.changes_since(since.unwrap_or(0))?;
         Ok(Changes {
-            changes: db.changes_since(since.since.unwrap_or(0))?,
+            changes,
+            latest_seq: db.latest_seq()?,
         })
     })
     .await
@@ -315,17 +359,19 @@ async fn changes(
 async fn insert(
     State(app): State<Arc<App>>,
     Path((tenant, table)): Path<(String, String)>,
-    body: Bytes,
-) -> Api<crate::Doc> {
-    let doc: Value = parse(&body)?;
-    with_tenant(app, tenant, move |db, _| db.insert(&table, doc)).await
+    Body(doc): Body<Value>,
+) -> Api<Doc> {
+    with_tenant(app, tenant, Missing::Skip, move |db, _| {
+        db.insert(&table, doc)
+    })
+    .await
 }
 
 async fn get_doc(
     State(app): State<Arc<App>>,
     Path((tenant, table, id)): Path<(String, String, i64)>,
-) -> Api<crate::Doc> {
-    with_tenant(app, tenant, move |db, _| db.get(&table, id)).await
+) -> Api<Doc> {
+    with_tenant(app, tenant, Missing::Skip, move |db, _| db.get(&table, id)).await
 }
 
 #[derive(Deserialize)]
@@ -338,94 +384,27 @@ struct UpdateBody {
 async fn update(
     State(app): State<Arc<App>>,
     Path((tenant, table, id)): Path<(String, String, i64)>,
-    body: Bytes,
-) -> Api<crate::Doc> {
-    let body: UpdateBody = parse(&body)?;
-    with_tenant(app, tenant, move |db, _| {
+    Body(body): Body<UpdateBody>,
+) -> Api<Doc> {
+    with_tenant(app, tenant, Missing::Skip, move |db, _| {
         db.update(&table, id, body.patch, body.version)
     })
     .await
 }
 
+#[derive(Deserialize)]
+struct Expected {
+    version: Option<i64>,
+}
+
 async fn delete(
     State(app): State<Arc<App>>,
     Path((tenant, table, id)): Path<(String, String, i64)>,
+    UrlQuery(Expected { version }): UrlQuery<Expected>,
 ) -> Api<Value> {
-    with_tenant(app, tenant, move |db, _| {
-        db.delete(&table, id, None)?;
+    with_tenant(app, tenant, Missing::Skip, move |db, _| {
+        db.delete(&table, id, version)?;
         Ok(json!({"deleted": true}))
     })
     .await
-}
-
-/// Streams changes as server-sent events. With `?since=N` it first replays
-/// everything after change `N`, then continues live, so a client that
-/// reconnects with the last `seq` it saw misses nothing.
-async fn subscribe(
-    State(app): State<Arc<App>>,
-    Path(tenant): Path<String>,
-    UrlQuery(since): UrlQuery<Since>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let (sender, receiver) = mpsc::channel::<Change>(SUBSCRIBER_BUFFER);
-    let (live, replay) = spawn_blocking(move || {
-        let db = app.tenant(&tenant)?;
-        // Subscribe before reading the backlog so nothing falls in between.
-        let live = db.subscribe();
-        let replay = match since.since {
-            Some(seq) => backlog(&db, seq)?,
-            None => Vec::new(),
-        };
-        Ok::<_, ApiError>((live, replay))
-    })
-    .await
-    .map_err(ApiError::internal)??;
-    tokio::spawn(forward(replay, live, sender));
-    let events = ReceiverStream::new(receiver).map(|change| {
-        let data = serde_json::to_string(&change).unwrap_or_default();
-        Ok(Event::default().id(change.seq.to_string()).data(data))
-    });
-    Ok(Sse::new(events).keep_alive(KeepAlive::default()))
-}
-
-fn backlog(db: &AgentDb, since: i64) -> Result<Vec<Change>, DbError> {
-    let mut all: Vec<Change> = Vec::new();
-    loop {
-        let from = all.last().map_or(since, |change| change.seq);
-        let page = db.changes_since(from)?;
-        if page.is_empty() {
-            return Ok(all);
-        }
-        all.extend(page);
-    }
-}
-
-/// Sends the backlog, then live changes, until the client disconnects or
-/// falls too far behind to follow.
-async fn forward(
-    replay: Vec<Change>,
-    mut live: broadcast::Receiver<Change>,
-    sender: mpsc::Sender<Change>,
-) {
-    let mut last = 0;
-    for change in replay {
-        last = change.seq;
-        if sender.send(change).await.is_err() {
-            return;
-        }
-    }
-    loop {
-        let received = tokio::select! {
-            () = sender.closed() => return,
-            received = live.recv() => received,
-        };
-        match received {
-            Ok(change) if change.seq > last => {
-                if sender.send(change).await.is_err() {
-                    return;
-                }
-            }
-            Ok(_) => {}
-            Err(_) => return,
-        }
-    }
 }
