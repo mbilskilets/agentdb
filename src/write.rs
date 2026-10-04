@@ -145,9 +145,7 @@ fn apply(conn: &Connection, defs: &[TableDef], write: Write, at: &str) -> Result
             patch,
             version,
         } => update(conn, find_def(defs, &table)?, id, version, patch, at),
-        Write::Delete { table, id, version } => {
-            delete(conn, defs, find_def(defs, &table)?, id, version, at)
-        }
+        Write::Delete { table, id, version } => delete(conn, defs, &table, id, version, at),
     }
 }
 
@@ -226,12 +224,12 @@ fn update(
 fn delete(
     conn: &Connection,
     defs: &[TableDef],
-    def: &TableDef,
+    table: &str,
     id: i64,
     expected_version: Option<i64>,
     at: &str,
 ) -> Result<Change> {
-    let table = def.name.as_str();
+    find_def(defs, table)?;
     let doc = read_doc(conn, table, id)?;
     check_version(table, &doc, expected_version)?;
     check_not_referenced(conn, defs, table, id)?;
