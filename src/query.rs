@@ -80,6 +80,8 @@ pub struct Filter {
     pub value: Value,
 }
 
+/// The order of the results. Documents with the same value follow in `id`
+/// order, also reversed when `descending`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sort {
     pub field: String,
@@ -289,8 +291,8 @@ impl Column {
         let precision = match op {
             Op::Eq if self.unique => 0,
             Op::Eq => 1,
-            Op::Gt | Op::Gte | Op::Lt | Op::Lte => 2,
-            Op::Ne | Op::Contains => return None,
+            _ if op.can_use_index() => 2,
+            _ => return None,
         };
         Some((precision, index))
     }
