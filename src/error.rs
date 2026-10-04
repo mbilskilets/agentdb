@@ -273,6 +273,11 @@ pub enum DbError {
         latest: i64,
     },
 
+    #[error(
+        "cannot continue after seq {since}: this database's newest change is seq {latest}. Seq {since} comes from another database, or from this one before it was restored from a backup. Read the current state again, then continue from seq {latest}."
+    )]
+    SinceAhead { since: i64, latest: i64 },
+
     #[error("the encryption key must not be empty.")]
     EmptyKey,
 
@@ -345,6 +350,7 @@ impl DbError {
             Self::IndexRequired { .. } => "index_required",
             Self::BatchTooLarge { .. } => "batch_too_large",
             Self::ChangesTrimmed { .. } => "changes_trimmed",
+            Self::SinceAhead { .. } => "since_ahead",
             Self::Jev(_) => "model_unavailable",
             Self::Storage(_) => "storage",
             Self::Internal(_) => "internal",

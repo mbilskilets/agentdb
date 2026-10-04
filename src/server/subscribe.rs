@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, Query as UrlQuery, State};
-use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::error::SendError;
@@ -43,7 +42,7 @@ pub(super) async fn subscribe(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let started = Feed::start(Arc::clone(&app), tenant.clone(), since).await?;
     if let (None, Some(since)) = (&started, since.filter(|since| *since > 0)) {
-        return Err(since_ahead(since, 0));
+        return Err(DbError::SinceAhead { since, latest: 0 }.into());
     }
     let (events, stream) = mpsc::channel(SUBSCRIBER_BUFFER);
     tokio::spawn(async move {
@@ -76,18 +75,6 @@ async fn run(
     {
         last_event.send(error.event());
     }
-}
-
-/// A `since` that the tenant's change log has not reached yet. Following it
-/// would hide every write until the log got there.
-fn since_ahead(since: i64, latest: i64) -> ApiError {
-    ApiError::new(
-        StatusCode::GONE,
-        "since_ahead",
-        format!(
-            "cannot continue after seq {since}: this tenant's newest change is seq {latest}. Seq {since} comes from another database, or from this one before it was restored from a backup. Read the current state again, then continue from seq {latest}."
-        ),
-    )
 }
 
 /// Why a feed stopped.
@@ -152,11 +139,10 @@ impl Feed {
             let Some(db) = app.tenants.open(&tenant, Missing::Skip)? else {
                 return Ok(None);
             };
-            let latest = db.latest_seq()?;
-            let last = since.unwrap_or(latest);
-            if last > latest {
-                return Err(since_ahead(last, latest));
-            }
+            let last = match since {
+                Some(seq) => seq,
+                None => db.latest_seq()?,
+            };
             let caught_up = catch_up(&db, last)?;
             let feed = Self {
                 db,

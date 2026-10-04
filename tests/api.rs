@@ -785,6 +785,22 @@ mod tests {
     }
 
     #[test]
+    fn a_seq_the_change_log_has_not_reached_is_refused() {
+        let db = crm();
+        db.insert("clients", json!({"name": "Acme", "status": "lead"}))
+            .unwrap();
+        let latest = db.latest_seq().unwrap();
+        assert_eq!(db.changes_since(latest).unwrap(), []);
+        let ahead = latest + 1;
+        assert_eq!(
+            message(db.changes_since(ahead)),
+            format!(
+                "cannot continue after seq {ahead}: this database's newest change is seq {latest}. Seq {ahead} comes from another database, or from this one before it was restored from a backup. Read the current state again, then continue from seq {latest}."
+            )
+        );
+    }
+
+    #[test]
     fn the_change_log_keeps_only_the_newest_changes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tenant.db");

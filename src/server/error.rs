@@ -83,7 +83,7 @@ fn status_of(code: &str) -> StatusCode {
         "version_conflict" | "duplicate_value" | "duplicates_exist" | "still_referenced"
         | "table_exists" | "field_exists" | "table_referenced" | "enum_value_in_use"
         | "index_required" | "would_destroy" => StatusCode::CONFLICT,
-        "changes_trimmed" => StatusCode::GONE,
+        "changes_trimmed" | "since_ahead" => StatusCode::GONE,
         "batch_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
         "missing_api_key" => StatusCode::SERVICE_UNAVAILABLE,
         "model_unavailable" => StatusCode::BAD_GATEWAY,

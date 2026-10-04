@@ -719,17 +719,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn subscribing_from_a_seq_the_log_has_not_reached_is_refused() {
+    async fn a_seq_the_log_has_not_reached_is_refused() {
         let (base, _dir) = start().await;
         define_clients(&base, "acme").await;
-        for (tenant, latest) in [("acme", 1), ("nobody", 0)] {
-            let ahead = of(&base, &format!("{tenant}/subscribe?since=100"));
+        let cases = [
+            ("acme/subscribe", 1),
+            ("acme/changes", 1),
+            ("nobody/subscribe", 0),
+            ("nobody/changes", 0),
+        ];
+        for (route, latest) in cases {
+            let ahead = of(&base, &format!("{route}?since=100"));
             let (status, body) = call("GET", ahead, SECRET, Value::Null).await;
             assert_eq!((status, code(&body)), (410, "since_ahead"));
             assert_eq!(
                 message(&body),
                 format!(
-                    "cannot continue after seq 100: this tenant's newest change is seq {latest}. Seq 100 comes from another database, or from this one before it was restored from a backup. Read the current state again, then continue from seq {latest}."
+                    "cannot continue after seq 100: this database's newest change is seq {latest}. Seq 100 comes from another database, or from this one before it was restored from a backup. Read the current state again, then continue from seq {latest}."
                 )
             );
         }

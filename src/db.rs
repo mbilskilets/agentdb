@@ -301,6 +301,8 @@ impl AgentDb {
     /// # Errors
     /// [`DbError::ChangesTrimmed`] when changes after `seq` have already been
     /// dropped from the log, so the caller cannot catch up from there.
+    /// [`DbError::SinceAhead`] when the log has not reached `seq` yet:
+    /// waiting for it would hide every write made until then.
     pub fn changes_since(&self, seq: i64) -> Result<Vec<Change>> {
         let seq = seq.max(0);
         self.read(|conn| {
@@ -311,6 +313,9 @@ impl AgentDb {
                     oldest,
                     latest,
                 });
+            }
+            if seq > latest {
+                return Err(DbError::SinceAhead { since: seq, latest });
             }
             conn.prepare(
                 "SELECT seq, tbl, kind, at, doc FROM changes WHERE seq > ?1 ORDER BY seq LIMIT ?2",
@@ -433,7 +438,8 @@ fn matching_page(
 /// empty log reports `(1, 0)`.
 fn change_log_range(conn: &Connection) -> Result<(i64, i64)> {
     Ok(conn.query_row(
-        "SELECT coalesce(min(seq), 1), coalesce(max(seq), 0) FROM changes",
+        "SELECT coalesce((SELECT min(seq) FROM changes), 1),
+                coalesce((SELECT max(seq) FROM changes), 0)",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?)

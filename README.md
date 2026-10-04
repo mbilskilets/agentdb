@@ -277,7 +277,9 @@ if (asked.page) {
 
 `ask` only reads. Always check `asked.query`, because that is what ran. If the query is right but `ask` refused out of caution, pass it to `find`.
 
-When the table is too large for the query `ask` built, `refusal` carries the `query_needs_index` message and `query` still shows what it understood.
+`asked.confidence` is the weakest of the model's answers that shaped the query, from 0 to 1. A query runs only at 0.6 or above. When the model's reply is cut short or an answer is unusable, the confidence is 0 and the query does not run.
+
+When the table is too large for the query `ask` built, `refusal` carries the `query_needs_index` or `query_too_slow` message and `query` still shows what it understood.
 
 See [how English queries work](#how-english-queries-work) for what it can do and how often it gets it right.
 
@@ -380,7 +382,7 @@ acme.version;  // number
 
 `ask` uses [Jev](https://docs.typesafe.ai), a small model from TypeSafe. Jev does not write text. It picks one option from a list, or gives the probability of a yes. So it cannot write a query, and agentdb does not ask it to.
 
-Instead, the code lists every choice the schema allows and Jev picks, all in one request:
+Instead, the code lists every choice the schema allows and Jev picks. When the schema fits in one request, that is all it takes:
 
 1. Which table is this about?
 2. For each fixed-choice field, which value does the request want, if any?
@@ -389,6 +391,8 @@ Instead, the code lists every choice the schema allows and Jev picks, all in one
 5. Is this a write, a sum, an either-or, or a comparison between records? If so, refuse.
 
 Code assembles the picks into a query. Jev reads dates as text and cannot do arithmetic, so the calendar maths for "last month" or "more than a year ago" happens in code.
+
+Jev accepts about 64,000 tokens per request. A schema too large for that takes one more request: `ask` first asks which table the request is about, then asks about that table alone. A request that still does not fit is refused before it is sent. A model that does not answer within 10 seconds counts as unavailable.
 
 Then a second, smaller request describes the built query in words and asks Jev whether the request contains anything the query leaves out. This catches a silently dropped condition. In testing, "clients in Poland" used to return every client, because clients have no country. The second check stops that.
 
@@ -404,13 +408,13 @@ Then a second, smaller request describes the built query in words and asks Jev w
 | superhard | 12 of 12 | 11 of 11 |
 | Total | 46 of 48 | 31 of 35 |
 
-I tuned the questions against the first set, so that number flatters it. I wrote the second set afterwards, and 31 of 35 is the honest score.
+I tuned the questions against the first set, so that number flatters it. I wrote the second set afterwards, and 31 of 35 is the honest score. It is no longer a fully unseen one: two of the refusal questions were reworded later with both sets in view.
 
 Neither set produced a wrong answer, meaning a query that ran and returned the wrong documents. Every miss was a refusal, and most refusals still returned the correct query as a best guess.
 
-One request takes about 0.55 seconds and costs about $0.0003.
+One request takes about 0.5 seconds and costs about $0.0003.
 
-It handles filters on any field type, "between" ranges, sorting, top N, missing values, negation, relative and exact dates, and requests in Polish. It refuses writes, sums and averages, OR conditions, questions that span two tables and requests about nothing in the database.
+It handles filters on any field type, "between" ranges, sorting, top N, missing values, negation of a fixed-choice value or a number, relative and exact dates, and requests in Polish. It refuses writes, sums and averages, OR conditions, questions that span two tables and requests about nothing in the database. It also refuses to exclude by text, as in "clients not named Acme": text is matched with `contains`, and a query has no "does not contain".
 
 The tasks are plain JSON in `evals/`. Add your own without touching Rust.
 
