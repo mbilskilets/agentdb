@@ -765,6 +765,18 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_seq_replays_the_change_log_from_the_start() {
+        let db = AgentDb::open_in_memory().unwrap();
+        assert_eq!(db.changes_since(-1).unwrap(), []);
+        define_crm(&db);
+        db.insert("clients", json!({"name": "Acme"})).unwrap();
+        let from_the_start = db.changes_since(0).unwrap();
+        assert_eq!(from_the_start.len(), 3);
+        assert_eq!(db.changes_since(-1).unwrap(), from_the_start);
+        assert_eq!(db.changes_since(i64::MIN).unwrap(), from_the_start);
+    }
+
+    #[test]
     fn the_change_log_keeps_only_the_newest_changes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tenant.db");

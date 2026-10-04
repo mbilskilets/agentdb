@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 use crate::ask::{self, Asked, Plan};
 use crate::change::{Change, ChangeKind};
 use crate::error::{DbError, Result};
-use crate::format::prepare;
+use crate::format::{prepare, supported_version};
 use crate::jev::Judge;
 use crate::query::{Compiled, Query, fields_with_index, register_functions};
 use crate::schema::{Field, FieldType, TableDef, closest, format_utc};
@@ -84,12 +84,14 @@ impl AgentDb {
     ///
     /// # Errors
     /// [`DbError::EmptyKey`] for an empty key, [`DbError::WrongKey`] when the key
-    /// does not match an existing file.
+    /// does not match an existing file, [`DbError::NewerFormat`] for a file
+    /// written by a newer agentdb, which is left exactly as it was.
     pub fn open(path: impl AsRef<Path>, key: &str) -> Result<Self> {
         if key.is_empty() {
             return Err(DbError::EmptyKey);
         }
         let mut writer = connect(path.as_ref(), key)?;
+        supported_version(&writer)?;
         writer.pragma_update(None, "journal_mode", "WAL")?;
         writer.pragma_update(None, "synchronous", "FULL")?;
         prepare(&mut writer)?;
@@ -293,13 +295,14 @@ impl AgentDb {
     }
 
     /// Returns up to 500 writes with a `seq` greater than `seq`, oldest first.
-    /// Start from 0 and pass the last `seq` you saw to catch up. Only the
-    /// newest 10,000 changes are kept.
+    /// Start from 0 and pass the last `seq` you saw to catch up; a negative
+    /// `seq` means 0. Only the newest 10,000 changes are kept.
     ///
     /// # Errors
     /// [`DbError::ChangesTrimmed`] when changes after `seq` have already been
     /// dropped from the log, so the caller cannot catch up from there.
     pub fn changes_since(&self, seq: i64) -> Result<Vec<Change>> {
+        let seq = seq.max(0);
         self.read(|conn| {
             let (oldest, latest) = change_log_range(conn)?;
             if seq < oldest - 1 {

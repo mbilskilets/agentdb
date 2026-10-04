@@ -49,17 +49,24 @@ CREATE INDEX docs_created_at ON docs (tbl, created_at, id);
 CREATE INDEX docs_updated_at ON docs (tbl, updated_at, id);
 ";
 
-/// Creates the storage tables in a new file, or upgrades an older file to
-/// the current layout. Either every step happens or the file is untouched.
-pub(crate) fn prepare(conn: &mut Connection) -> Result<()> {
-    let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let found: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+/// The format version of the file behind `conn`, read without changing the
+/// file. Refuses a file that a newer agentdb wrote.
+pub(crate) fn supported_version(conn: &Connection) -> Result<i64> {
+    let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if found > FORMAT_VERSION {
         return Err(DbError::NewerFormat {
             found,
             supported: FORMAT_VERSION,
         });
     }
+    Ok(found)
+}
+
+/// Creates the storage tables in a new file, or upgrades an older file to
+/// the current layout. Either every step happens or the file is untouched.
+pub(crate) fn prepare(conn: &mut Connection) -> Result<()> {
+    let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let found = supported_version(&transaction)?;
     if found < 1 {
         transaction.execute_batch(VERSION_1)?;
     }

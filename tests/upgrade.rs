@@ -147,15 +147,29 @@ mod tests {
 
     #[test]
     fn a_file_from_a_newer_agentdb_is_refused_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tenant.db");
-        raw(&path)
-            .execute_batch(&format!("{VERSION_1_TABLES} PRAGMA user_version = 3;"))
-            .unwrap();
-        assert_eq!(
-            AgentDb::open(&path, KEY).unwrap_err().to_string(),
-            "this database file uses storage format 3, but this version of agentdb only understands up to 2. Upgrade agentdb."
-        );
-        assert_eq!(format_version(&path), 3);
+        for journal_mode in ["DELETE", "WAL"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tenant.db");
+            let newer = raw(&path);
+            newer
+                .pragma_update(None, "journal_mode", journal_mode)
+                .unwrap();
+            newer
+                .execute_batch(&format!("{VERSION_1_TABLES} PRAGMA user_version = 3;"))
+                .unwrap();
+            drop(newer);
+            let written = std::fs::read(&path).unwrap();
+
+            assert_eq!(
+                AgentDb::open(&path, KEY).unwrap_err().to_string(),
+                "this database file uses storage format 3, but this version of agentdb only understands up to 2. Upgrade agentdb."
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), written);
+            let files: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(files, ["tenant.db"]);
+        }
     }
 }
