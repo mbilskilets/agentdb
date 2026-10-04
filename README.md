@@ -508,7 +508,7 @@ This is young software. Know these before you depend on it.
 |---|---|
 | `./check.sh` | Formatting, lints as errors, Rust tests, dependency audit. It must pass before a change counts as done. |
 | `cd sdk && npm test` | SDK tests against the real server. Build it first with `cargo build --bin agentdb-server`. |
-| `cd demo && npm run typecheck && npx next build` | Type-checks and builds the demo. Build the SDK first with `cd sdk && npm run build`. |
+| `cd demo && npm test && npm run typecheck && npx next build` | Tests the demo's password check, then type-checks and builds the demo. Build the SDK first with `cd sdk && npm run build`. |
 | `./eval.sh` | English-query scores. Pass `evals/holdout.json` for the unseen set. |
 
 | Path | What is there |
