@@ -1,13 +1,17 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use ureq::Agent;
 
 use crate::error::{DbError, Result};
 
 const URL: &str = "https://api.typesafe.ai/v1/systemone";
 const MODEL: &str = "jev-latest";
 const KEY_VAR: &str = "TYPESAFE_API_KEY";
+/// A request normally takes well under a second.
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A question for the model. It never writes text: it picks one option or
 /// gives the probability of "yes".
@@ -65,6 +69,7 @@ pub trait Judge {
 #[derive(Clone)]
 pub struct Jev {
     key: String,
+    agent: Agent,
 }
 
 impl fmt::Debug for Jev {
@@ -75,7 +80,18 @@ impl fmt::Debug for Jev {
 
 impl Jev {
     pub fn new(key: impl Into<String>) -> Self {
-        Self { key: key.into() }
+        Self::with_timeout(key, TIMEOUT)
+    }
+
+    fn with_timeout(key: impl Into<String>, timeout: Duration) -> Self {
+        let agent = Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .build()
+            .into();
+        Self {
+            key: key.into(),
+            agent,
+        }
     }
 
     /// Reads the key from the `TYPESAFE_API_KEY` environment variable.
@@ -97,17 +113,77 @@ struct Request<'a> {
     questions: &'a BTreeMap<String, Question>,
 }
 
-impl Judge for Jev {
-    fn judge(&self, state: &str, questions: &BTreeMap<String, Question>) -> Result<Judgement> {
+impl Jev {
+    fn judge_at(
+        &self,
+        url: &str,
+        state: &str,
+        questions: &BTreeMap<String, Question>,
+    ) -> Result<Judgement> {
         let request = Request {
             state,
             model: MODEL,
             questions,
         };
-        ureq::post(URL)
+        self.agent
+            .post(url)
             .header("Authorization", format!("Bearer {}", self.key))
             .send_json(&request)
             .and_then(|mut response| response.body_mut().read_json::<Judgement>())
-            .map_err(|error| DbError::Jev(error.to_string()))
+            .map_err(|error| match error {
+                ureq::Error::Timeout(_) => {
+                    DbError::Jev("the model took too long to answer".to_owned())
+                }
+                other => DbError::Jev(other.to_string()),
+            })
+    }
+}
+
+impl Judge for Jev {
+    fn judge(&self, state: &str, questions: &BTreeMap<String, Question>) -> Result<Judgement> {
+        self.judge_at(URL, state, questions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    use super::Jev;
+
+    #[test]
+    fn a_model_that_never_answers_fails_instead_of_blocking() {
+        let stalled = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", stalled.local_addr().unwrap());
+        let jev = Jev::with_timeout("secret-key", Duration::from_millis(200));
+
+        let started = Instant::now();
+        let error = jev
+            .judge_at(&url, "all clients", &BTreeMap::new())
+            .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(error.code(), "model_unavailable");
+        assert_eq!(
+            error.to_string(),
+            "the language model request failed: the model took too long to answer. find() works without the model."
+        );
+    }
+
+    #[test]
+    fn the_key_is_hidden_from_debug_output_and_errors() {
+        let jev = Jev::new("secret-key");
+        assert_eq!(format!("{jev:?}"), "Jev { key: <hidden> }");
+
+        let refused = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", refused.local_addr().unwrap());
+        drop(refused);
+        let error = jev
+            .judge_at(&url, "all clients", &BTreeMap::new())
+            .unwrap_err();
+        assert!(!error.to_string().contains("secret-key"));
+        assert!(!format!("{error:?}").contains("secret-key"));
     }
 }

@@ -17,6 +17,8 @@ use serde_json::Value;
 /// Dollars per input token for Jev.
 const PRICE: f64 = 0.042 / 1e6;
 const LEVELS: [&str; 4] = ["simple", "normal", "hard", "superhard"];
+/// The option the model picks when no other fits.
+const NONE: &str = "none of the above";
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -94,10 +96,11 @@ impl Tally {
     }
 }
 
-/// Keeps the model's raw answers so a failed task can show them.
+/// Keeps the model's raw answers to every request of one task, so a failed
+/// task can show them.
 struct Recorder {
     jev: Jev,
-    last: RefCell<Judgement>,
+    answers: RefCell<BTreeMap<String, Answer>>,
 }
 
 impl Judge for Recorder {
@@ -107,19 +110,18 @@ impl Judge for Recorder {
         questions: &BTreeMap<String, Question>,
     ) -> agentdb::Result<Judgement> {
         let judgement = self.jev.judge(state, questions)?;
-        self.last.replace(judgement.clone());
+        self.answers.borrow_mut().extend(judgement.answers.clone());
         Ok(judgement)
     }
 }
 
 /// The answers that shaped the query, plus the ones the model was unsure of.
-fn trace(judgement: &Judgement) -> String {
-    let parts: Vec<String> = judgement
-        .answers
+fn trace(answers: &BTreeMap<String, Answer>) -> String {
+    let parts: Vec<String> = answers
         .iter()
         .filter_map(|(id, answer)| match answer {
             Answer::Noul { noul } if *noul >= 0.35 => Some(format!("{id}={noul:.2}")),
-            Answer::Choice { choice, confidence } if choice != "none" || *confidence < 0.7 => {
+            Answer::Choice { choice, confidence } if choice != NONE || *confidence < 0.7 => {
                 Some(format!("{id}={choice}({confidence:.2})"))
             }
             _ => None,
@@ -185,7 +187,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let db = seeded()?;
     let jev = Recorder {
         jev: Jev::from_env()?,
-        last: RefCell::new(Judgement::default()),
+        answers: RefCell::new(BTreeMap::new()),
     };
     let verbose = std::env::args().any(|arg| arg == "--verbose");
     let path = std::env::args()
@@ -198,6 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut millis: Vec<u128> = Vec::new();
     let mut tokens: u64 = 0;
     for case in &cases {
+        jev.answers.borrow_mut().clear();
         let started = Instant::now();
         let asked = db.ask(&jev, &case.ask)?;
         millis.push(started.elapsed().as_millis());
@@ -213,7 +216,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         if verbose || verdict != Verdict::Pass {
             println!("           {}", explain(&asked));
-            println!("           model: {}", trace(&jev.last.borrow()));
+            println!("           model: {}", trace(&jev.answers.borrow()));
         }
     }
 
@@ -242,8 +245,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         reason = "token counts are far below 2^52"
     )]
     let cost = tokens as f64 * PRICE;
+    let per_ask = tokens / u64::from(total.max(1));
     println!(
-        "\noverall {pass}/{total} pass, {wrong} wrong | median {median} ms, slowest {slowest} ms | {tokens} tokens, ${cost:.4}"
+        "\noverall {pass}/{total} pass, {wrong} wrong | median {median} ms, slowest {slowest} ms | {tokens} tokens ({per_ask} per ask), ${cost:.4}"
     );
     Ok(())
 }
