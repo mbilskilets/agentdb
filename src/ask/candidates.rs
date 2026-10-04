@@ -4,7 +4,7 @@ use serde_json::Value;
 use time::Date;
 use time::format_description::well_known::Iso8601;
 
-pub(super) const MAX_PHRASE_WORDS: usize = 3;
+const MAX_PHRASE_WORDS: usize = 3;
 const MAX_PHRASES: usize = 150;
 const UNITS: [&str; 4] = ["day", "week", "month", "year"];
 const COUNT_WORDS: [(&str, i64); 12] = [

@@ -6,14 +6,14 @@ mod tests {
     use agentdb::{AgentDb, Answer, FieldType, Judge, Judgement, Op, Query, Question, TableDef};
     use serde_json::json;
 
-    const NONE: &str = "none of the above";
+    const NONE: &str = "none.";
     const TOO_LARGE: &str = "ask() could not fit this request and the choices the schema allows into one request to the model. Shorten the request if it is long; otherwise use find() with an explicit query.";
 
     type Questions = BTreeMap<String, Question>;
 
     /// Answers every request from the same canned answers, so `ask()` can be
     /// tested without the network. A question with no canned answer gets a
-    /// sure "no", or a sure "none of the above".
+    /// sure "no" or a sure "none".
     struct Canned(BTreeMap<String, Answer>);
 
     impl Judge for Canned {
@@ -21,20 +21,31 @@ mod tests {
             let answers = questions
                 .iter()
                 .map(|(id, question)| {
-                    let default = match question {
-                        Question::Noul { .. } => Answer::Noul { noul: 0.0 },
-                        Question::Choice { .. } => Answer::Choice {
-                            choice: NONE.to_owned(),
-                            confidence: 1.0,
-                        },
-                    };
-                    (id.clone(), self.0.get(id).cloned().unwrap_or(default))
+                    let canned = self.0.get(id).cloned();
+                    (id.clone(), canned.unwrap_or_else(|| sure_no(question)))
                 })
                 .collect();
             Ok(Judgement {
                 answers,
                 ..Judgement::default()
             })
+        }
+    }
+
+    fn sure_no(question: &Question) -> Answer {
+        match question {
+            Question::Noul { .. } => Answer::Noul { noul: 0.0 },
+            Question::Choice { criteria, .. } => {
+                let none = if criteria.contains_key(NONE) {
+                    NONE
+                } else {
+                    "none"
+                };
+                Answer::Choice {
+                    choice: none.to_owned(),
+                    confidence: 1.0,
+                }
+            }
         }
     }
 
@@ -137,11 +148,11 @@ mod tests {
     fn picks_become_a_query_that_runs() {
         let judge = canned([
             pick("table", "clients"),
-            pick("field.status", "is lead"),
-            pick("number.0.role", "revenue"),
+            pick("clients/field.status", "is lead"),
+            pick("clients/number.0.role", "revenue"),
             pick("number.0.comparison", "more_than"),
             pick("period", "today"),
-            pick("period.field", "created_at"),
+            pick("clients/period.field", "created_at"),
         ]);
         let asked = crm()
             .ask(&judge, "leads created today with revenue over 100")
@@ -160,12 +171,12 @@ mod tests {
     fn excluded_values_sorting_and_limits_are_understood() {
         let judge = canned([
             pick("table", "clients"),
-            pick("field.status", "not lead"),
-            pick("number.0.role", "limit of results"),
+            pick("clients/field.status", "not lead"),
+            pick("clients/number.0.role", "limit."),
             noul("sort", 0.97),
-            pick("sort.field", "revenue"),
+            pick("clients/sort.field", "revenue"),
             pick("sort.direction", "descending"),
-            pick("missing", "signed_at"),
+            pick("clients/missing", "signed_at"),
         ]);
         let asked = crm()
             .ask(&judge, "top 2 unsigned clients that are not leads")
@@ -183,9 +194,9 @@ mod tests {
     fn text_is_matched_by_what_it_contains() {
         let judge = canned([
             pick("table", "clients"),
-            noul("field.name", 0.9),
-            pick("field.name.match", "is"),
-            pick("field.name.value", "acme"),
+            noul("clients/field.name", 0.9),
+            pick("clients/field.name.match", "is"),
+            pick("clients/field.name.value", "acme"),
         ]);
         let asked = crm().ask(&judge, "clients named acme").unwrap();
         assert_eq!(
@@ -199,9 +210,9 @@ mod tests {
     fn excluding_by_text_is_refused_because_no_query_can_say_it() {
         let judge = canned([
             pick("table", "clients"),
-            noul("field.name", 0.9),
-            pick("field.name.match", "is_not"),
-            pick("field.name.value", "Acme"),
+            noul("clients/field.name", 0.9),
+            pick("clients/field.name.match", "is_not"),
+            pick("clients/field.name.value", "Acme"),
         ]);
         let asked = crm().ask(&judge, "clients not named Acme").unwrap();
         assert_eq!(asked.page, None);
@@ -218,7 +229,7 @@ mod tests {
     fn a_minus_sign_in_the_request_reaches_the_query() {
         let judge = canned([
             pick("table", "clients"),
-            pick("number.0.role", "revenue"),
+            pick("clients/number.0.role", "revenue"),
             pick("number.0.comparison", "more_than"),
         ]);
         let asked = crm().ask(&judge, "clients with revenue above -20").unwrap();
@@ -233,7 +244,7 @@ mod tests {
     fn a_limit_that_is_not_a_whole_number_is_refused() {
         let judge = canned([
             pick("table", "clients"),
-            pick("number.0.role", "limit of results"),
+            pick("clients/number.0.role", "limit."),
         ]);
         let asked = crm().ask(&judge, "top 2.5 clients").unwrap();
         assert_eq!(asked.page, None);
@@ -253,7 +264,7 @@ mod tests {
         )
         .unwrap();
         let state = |option: &str| {
-            let judge = canned([pick("table", "tasks"), pick("field.state", option)]);
+            let judge = canned([pick("table", "tasks"), pick("tasks/field.state", option)]);
             db.ask(&judge, "tasks").unwrap().query.unwrap().filters
         };
         let tasks = |op: Op, value: &str| Query::table("tasks").filter("state", op, value).filters;
@@ -277,10 +288,10 @@ mod tests {
         .unwrap();
         let judge = canned([
             pick("table", "plans"),
-            pick("number.0.role", "limit of results"),
-            pick("number.1.role", "limit"),
+            pick("plans/number.0.role", "limit."),
+            pick("plans/number.1.role", "limit"),
             pick("number.1.comparison", "more_than"),
-            pick("number.2.role", "period"),
+            pick("plans/number.2.role", "period"),
             pick("number.2.comparison", "is"),
         ]);
         let asked = db
@@ -297,26 +308,33 @@ mod tests {
     #[test]
     fn tables_and_fields_named_like_questions_keep_their_own_answers() {
         let db = AgentDb::open_in_memory().unwrap();
-        db.define_table(
-            &TableDef::new("none")
-                .optional("missing", FieldType::Bool)
-                .optional("present", FieldType::Text)
-                .optional("date_field", FieldType::Datetime)
-                .optional("sort", FieldType::Number)
-                .optional("none", FieldType::Bool),
-        )
-        .unwrap();
+        for table in ["none", "sort", "period", "number", "field"] {
+            db.define_table(
+                &TableDef::new(table)
+                    .optional("missing", FieldType::Bool)
+                    .optional("present", FieldType::Text)
+                    .optional("date_field", FieldType::Datetime)
+                    .optional("sort", FieldType::Number)
+                    .optional("field", FieldType::Bool)
+                    .optional("none", FieldType::Bool),
+            )
+            .unwrap();
+        }
         db.freeze_time(Some("2026-10-03T12:00:00Z")).unwrap();
         let judge = canned([
             pick("table", "none"),
-            pick("field.missing", "yes"),
-            pick("field.none", "no"),
-            pick("missing", "present"),
+            pick("none/field.missing", "yes"),
+            pick("none/field.none", "no"),
+            pick("none/missing", "present"),
             pick("period", "today"),
-            pick("period.field", "date_field"),
+            pick("none/period.field", "date_field"),
             noul("sort", 0.97),
-            pick("sort.field", "sort"),
+            pick("none/sort.field", "sort"),
             pick("sort.direction", "ascending"),
+            pick("sort/field.field", "yes"),
+            pick("field/sort.field", "field"),
+            pick("period/period.field", "created_at"),
+            pick("number/field.none", "yes"),
         ]);
         let asked = db.ask(&judge, "anything").unwrap();
         let expected = Query::table("none")
@@ -373,7 +391,7 @@ mod tests {
         };
         let judge = canned([
             pick("table", "clients"),
-            ("field.status".to_owned(), unsure),
+            ("clients/field.status".to_owned(), unsure),
         ]);
         let asked = crm().ask(&judge, "leads").unwrap();
         assert_eq!(asked.page, None);
@@ -414,9 +432,9 @@ mod tests {
     fn an_answer_that_cannot_be_used_is_not_run() {
         let unusable = [
             ("write", Answer::Other),
-            ("field.status", Answer::Other),
-            ("field.status", Answer::Noul { noul: 0.9 }),
-            ("field.status", pick("", "is churned").1),
+            ("clients/field.status", Answer::Other),
+            ("clients/field.status", Answer::Noul { noul: 0.9 }),
+            ("clients/field.status", pick("", "is churned").1),
             ("sort", pick("", "revenue").1),
             ("leftover", Answer::Other),
         ];
@@ -452,23 +470,42 @@ mod tests {
     }
 
     #[test]
-    fn more_tables_do_not_add_to_what_is_asked_about_one_table() {
-        let about_clients = |other_tables: usize| {
-            let db = crm();
-            for index in 0..other_tables {
-                db.define_table(
-                    &TableDef::new(format!("archive_{index}"))
-                        .optional("title", FieldType::Text)
-                        .optional("notes", FieldType::Text),
-                )
-                .unwrap();
-            }
-            let judge = Recording::new(canned([pick("table", "clients")]));
-            let asked = db.ask(&judge, "clients whose name is Acme").unwrap();
-            assert_eq!(asked.page.unwrap().total, 3);
-            judge.requests.into_inner().swap_remove(1)
-        };
-        assert_eq!(about_clients(40), about_clients(0));
+    fn a_small_schema_is_asked_about_in_one_request_and_then_checked() {
+        let judge = Recording::new(canned([pick("table", "clients")]));
+        let asked = crm().ask(&judge, "all clients").unwrap();
+        assert_eq!(asked.page.unwrap().total, 3);
+        assert_eq!(judge.requests.into_inner().len(), 2);
+    }
+
+    #[test]
+    fn a_schema_too_large_for_one_request_is_asked_about_one_table_at_a_time() {
+        let db = crm();
+        for index in 0..200 {
+            db.define_table(
+                &TableDef::new(format!("archive_{index}"))
+                    .optional("title", FieldType::Text)
+                    .optional("notes", FieldType::Text),
+            )
+            .unwrap();
+        }
+        let judge = Recording::new(canned([
+            pick("table", "clients"),
+            pick("clients/field.status", "is lead"),
+        ]));
+        let asked = db.ask(&judge, "clients that are leads").unwrap();
+        assert_eq!(asked.page.unwrap().total, 2);
+
+        let requests = judge.requests.into_inner();
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert!(serde_json::to_string(request).unwrap().len() < 60_000);
+        }
+        let about_other_tables: Vec<&String> = requests
+            .iter()
+            .flat_map(BTreeMap::keys)
+            .filter(|id| id.starts_with("archive_"))
+            .collect();
+        assert_eq!(about_other_tables, Vec::<&String>::new());
     }
 
     #[test]
@@ -492,7 +529,7 @@ mod tests {
         let judge = Recording::new(canned([pick("table", "parts")]));
         let asked = db.ask(&judge, "parts with code 7").unwrap();
         assert_eq!(asked.page, None);
+        assert_eq!(asked.query, None);
         assert_eq!(asked.refusal.as_deref(), Some(TOO_LARGE));
-        assert_eq!(judge.requests.into_inner().len(), 1);
     }
 }

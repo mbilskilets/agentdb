@@ -2,9 +2,10 @@
 //! under.
 //!
 //! Tables and fields are named with lowercase letters, digits and
-//! underscores. Every option that is not such a name contains a space, and
-//! every question id that carries a field name starts with `field.`, so no
-//! schema can make two options or two questions share a name.
+//! underscores, so no schema can make two questions or two options share a
+//! name. A question about one table has an id that starts with the table's
+//! name and a `/`, and a question about one field continues with `field.`
+//! and the field's name. An option listed next to names ends in a full stop.
 
 use std::collections::BTreeMap;
 
@@ -20,43 +21,58 @@ pub(super) type Questions = BTreeMap<String, Question>;
 pub(super) mod id {
     pub(in crate::ask) const TABLE: &str = "table";
     pub(in crate::ask) const SORT: &str = "sort";
-    pub(in crate::ask) const SORT_FIELD: &str = "sort.field";
     pub(in crate::ask) const SORT_DIRECTION: &str = "sort.direction";
     pub(in crate::ask) const PERIOD: &str = "period";
-    pub(in crate::ask) const PERIOD_FIELD: &str = "period.field";
     pub(in crate::ask) const PERIOD_UNIT: &str = "period.unit";
     pub(in crate::ask) const PERIOD_DATE: &str = "period.date";
-    pub(in crate::ask) const MISSING: &str = "missing";
-    pub(in crate::ask) const PRESENT: &str = "present";
     pub(in crate::ask) const LEFTOVER: &str = "leftover";
 
-    /// What the number at `index` in the request is for.
-    pub(in crate::ask) fn number_role(index: usize) -> String {
-        format!("number.{index}.role")
-    }
-
+    /// How the request compares something against its number at `index`.
     pub(in crate::ask) fn number_comparison(index: usize) -> String {
         format!("number.{index}.comparison")
     }
 
+    /// What the number at `index` is for, if the request is about `table`.
+    pub(in crate::ask) fn number_role(table: &str, index: usize) -> String {
+        format!("{table}/number.{index}.role")
+    }
+
+    pub(in crate::ask) fn sort_field(table: &str) -> String {
+        format!("{table}/sort.field")
+    }
+
+    pub(in crate::ask) fn period_field(table: &str) -> String {
+        format!("{table}/period.field")
+    }
+
+    pub(in crate::ask) fn missing(table: &str) -> String {
+        format!("{table}/missing")
+    }
+
+    pub(in crate::ask) fn present(table: &str) -> String {
+        format!("{table}/present")
+    }
+
     /// How the request restricts the field called `name`.
-    pub(in crate::ask) fn field(name: &str) -> String {
-        format!("field.{name}")
+    pub(in crate::ask) fn field(table: &str, name: &str) -> String {
+        format!("{table}/field.{name}")
     }
 
-    pub(in crate::ask) fn text_match(name: &str) -> String {
-        format!("field.{name}.match")
+    pub(in crate::ask) fn text_match(table: &str, name: &str) -> String {
+        format!("{table}/field.{name}.match")
     }
 
-    pub(in crate::ask) fn text_value(name: &str) -> String {
-        format!("field.{name}.value")
+    pub(in crate::ask) fn text_value(table: &str, name: &str) -> String {
+        format!("{table}/field.{name}.value")
     }
 }
 
-/// Says that no other option fits. Its four words keep it apart from every
-/// name and from every phrase of the request, which has at most three.
-pub(super) const NONE: &str = "none of the above";
+/// Says that no listed name, value or phrase fits. It ends in a full stop,
+/// which no name can contain and no phrase of the request can end with.
+pub(super) const NONE: &str = "none.";
+pub(super) const NO_PERIOD: &str = "none";
 pub(super) const YES: &str = "yes";
+pub(super) const NO: &str = "no";
 pub(super) const BY_ID: &str = "by_id";
 pub(super) const BY_PROPERTY: &str = "by_property";
 pub(super) const IS_NOT: &str = "is_not";
@@ -64,15 +80,17 @@ pub(super) const ASCENDING: &str = "ascending";
 /// The number is the id of the documents themselves. `id` is reserved, so no
 /// field has this name.
 pub(super) const ROLE_ID: &str = "id";
-pub(super) const ROLE_LIMIT: &str = "limit of results";
-pub(super) const ROLE_SPAN: &str = "period of time";
+/// The number is how many results to return.
+pub(super) const ROLE_LIMIT: &str = "limit.";
+/// The number counts the days, weeks, months or years of a time period.
+pub(super) const ROLE_SPAN: &str = "period.";
 
 /// Requests `ask()` does not answer: the question that detects each one, and
 /// what to tell the caller.
 pub(super) const UNSUPPORTED: [(&str, &str, &str); 4] = [
     (
         "write",
-        "Does the request ask to create, change, or delete records, rather than only look them up?",
+        "Does the request tell the database to add, change or remove data, as in \"delete X\" or \"set Y to Z\"? Answer no if it only asks to see or count records.",
         "ask() only reads. This looks like a request to change data: use insert(), update() or delete().",
     ),
     (
@@ -82,7 +100,7 @@ pub(super) const UNSUPPORTED: [(&str, &str, &str); 4] = [
     ),
     (
         "either_or",
-        "Does the request accept records that meet one condition OR a different condition, as alternatives? Answer no if every condition must hold together.",
+        "Does the request ask for records matching any one of several alternatives, as in \"red or blue\" or \"either open or closed\"? Answer no when every condition it states must hold.",
         "ask() cannot combine conditions with OR. Call ask() once per alternative.",
     ),
     (
@@ -201,9 +219,10 @@ fn describe_table(def: &TableDef) -> String {
     }
 }
 
-/// The first request: which table the request is about, and whether it is
-/// something `ask()` answers at all.
-pub(super) fn routing(defs: &[TableDef]) -> Questions {
+/// What is asked whichever table the request is about: which table that is,
+/// whether it is something `ask()` answers at all, and how it orders, dates
+/// and compares.
+pub(super) fn general(defs: &[TableDef], found: &Candidates) -> Questions {
     let tables = defs
         .iter()
         .map(|def| (def.name.clone(), describe_table(def)))
@@ -211,74 +230,14 @@ pub(super) fn routing(defs: &[TableDef]) -> Questions {
             NONE.to_owned(),
             "the request is not about any of these record types".to_owned(),
         )]);
-    let mut questions = Questions::from([(
-        id::TABLE.to_owned(),
-        choice(
-            "Which kind of record does the request ask for? A request may name records by one of their listed values, such as a status or a role.",
-            tables,
-        ),
-    )]);
-    for (id, instructions, _) in UNSUPPORTED {
-        questions.insert(id.to_owned(), noul(instructions));
-    }
-    questions
-}
-
-/// The second request: everything the request can say about one table.
-pub(super) fn about(def: &TableDef, found: &Candidates) -> Questions {
-    let table = &def.name;
-    let mut questions = sort_questions(def);
-    questions.extend(period_questions(def, found));
-    for field in &def.fields {
-        questions.extend(field_questions(table, field, found));
-    }
-    for (index, (label, _)) in found.numbers.iter().enumerate() {
-        questions.insert(id::number_role(index), number_role(def, label));
-        questions.insert(
-            id::number_comparison(index),
+    let mut questions = Questions::from([
+        (
+            id::TABLE.to_owned(),
             choice(
-                format!("The request mentions \"{label}\". How does it compare something against that number?"),
-                COMPARISONS.map(|(name, description, _)| (name, description)),
+                "Which kind of record does the request ask for? A request may name records by one of their listed values, such as a status or a role.",
+                tables,
             ),
-        );
-    }
-    let nullable = || def.fields.iter().filter(|field| can_be_empty(field));
-    questions.insert(
-        id::MISSING.to_owned(),
-        choice(
-            format!("Does the request ask only for {table} that lack something, with words like without, no, never, missing or not yet? If so, what do they lack?"),
-            nullable()
-                .map(|field| (field.name.clone(), format!("only {table} that have no `{}`", field.name)))
-                .chain([(NONE.to_owned(), "the request does not ask for records that lack something".to_owned())]),
         ),
-    );
-    questions.insert(
-        id::PRESENT.to_owned(),
-        choice(
-            format!("Does the request say outright that the {table} must have something, whatever its value, with words like \"that have\", \"with a\" or \"having\"? If so, what must they have?"),
-            nullable()
-                .map(|field| (field.name.clone(), format!("only {table} that have some `{}`, whatever it is", field.name)))
-                .chain([(NONE.to_owned(), "the request does not say this, which is the usual case".to_owned())]),
-        ),
-    );
-    questions
-}
-
-/// The last request: does the query cover everything that was asked? It
-/// catches a condition that was silently dropped.
-pub(super) fn verification(description: &str) -> Questions {
-    Questions::from([(
-        id::LEFTOVER.to_owned(),
-        noul(format!(
-            "A search was built to answer the request. The search returns: {description}. Does the request ask for a condition, restriction or detail that this search leaves out?"
-        )),
-    )])
-}
-
-fn sort_questions(def: &TableDef) -> Questions {
-    let table = &def.name;
-    let field_names = def.fields.iter().map(|field| field.name.as_str());
-    Questions::from([
         (
             id::SORT.to_owned(),
             noul(
@@ -302,35 +261,13 @@ fn sort_questions(def: &TableDef) -> Questions {
             ),
         ),
         (
-            id::SORT_FIELD.to_owned(),
-            choice(
-                format!("Which property of the {table} does the request order or rank them by?"),
-                field_names
-                    .chain(["id", "created_at", "updated_at"])
-                    .map(|name| (name.to_owned(), format!("ordered by `{name}`")))
-                    .chain([(NONE.to_owned(), "no ordering is requested".to_owned())]),
-            ),
-        ),
-    ])
-}
-
-fn period_questions(def: &TableDef, found: &Candidates) -> Questions {
-    let table = &def.name;
-    let date_columns = def
-        .fields
-        .iter()
-        .filter(|field| field.kind == FieldType::Datetime)
-        .map(|field| field.name.as_str())
-        .chain(["created_at", "updated_at"]);
-    Questions::from([
-        (
             id::PERIOD.to_owned(),
             choice(
                 "Which time period does the request restrict the records to?",
                 PERIODS
                     .iter()
                     .copied()
-                    .chain([(NONE, "the request has no time condition")]),
+                    .chain([(NO_PERIOD, "the request has no time condition")]),
             ),
         ),
         (
@@ -347,24 +284,98 @@ fn period_questions(def: &TableDef, found: &Candidates) -> Questions {
                 found.dates.iter().map(|(label, _)| label.clone()),
             ),
         ),
-        (
-            id::PERIOD_FIELD.to_owned(),
+    ]);
+    for (id, instructions, _) in UNSUPPORTED {
+        questions.insert(id.to_owned(), noul(instructions));
+    }
+    for (index, (label, _)) in found.numbers.iter().enumerate() {
+        questions.insert(
+            id::number_comparison(index),
             choice(
-                format!("Which date of the {table} does the request's time condition apply to?"),
-                date_columns
-                    .map(|name| {
-                        (
-                            name.to_owned(),
-                            format!("the time condition is about `{name}`"),
-                        )
-                    })
-                    .chain([(
-                        NONE.to_owned(),
-                        "the request has no time condition".to_owned(),
-                    )]),
+                format!("The request mentions \"{label}\". How does it compare something against that number?"),
+                COMPARISONS.map(|(name, description, _)| (name, description)),
             ),
+        );
+    }
+    questions
+}
+
+/// What is asked about one table: everything the request can say about its
+/// fields.
+pub(super) fn about(def: &TableDef, found: &Candidates) -> Questions {
+    let table = &def.name;
+    let mut questions = Questions::new();
+    for field in &def.fields {
+        questions.extend(field_questions(table, field, found));
+    }
+    let field_names = def.fields.iter().map(|field| field.name.as_str());
+    questions.insert(
+        id::sort_field(table),
+        choice(
+            format!("Which property of the {table} does the request order or rank them by?"),
+            field_names
+                .chain(["id", "created_at", "updated_at"])
+                .map(|name| (name.to_owned(), format!("ordered by `{name}`")))
+                .chain([(NONE.to_owned(), "no ordering is requested".to_owned())]),
         ),
-    ])
+    );
+    let date_columns = def
+        .fields
+        .iter()
+        .filter(|field| field.kind == FieldType::Datetime)
+        .map(|field| field.name.as_str())
+        .chain(["created_at", "updated_at"]);
+    questions.insert(
+        id::period_field(table),
+        choice(
+            format!("Which date of the {table} does the request's time condition apply to?"),
+            date_columns
+                .map(|name| {
+                    (
+                        name.to_owned(),
+                        format!("the time condition is about `{name}`"),
+                    )
+                })
+                .chain([(
+                    NONE.to_owned(),
+                    "the request has no time condition".to_owned(),
+                )]),
+        ),
+    );
+    for (index, (label, _)) in found.numbers.iter().enumerate() {
+        questions.insert(id::number_role(table, index), number_role(def, label));
+    }
+    let nullable = || def.fields.iter().filter(|field| can_be_empty(field));
+    questions.insert(
+        id::missing(table),
+        choice(
+            format!("Does the request ask only for {table} that lack something, with words like without, no, never, missing or not yet? If so, what do they lack?"),
+            nullable()
+                .map(|field| (field.name.clone(), format!("only {table} that have no `{}`", field.name)))
+                .chain([(NONE.to_owned(), "the request does not ask for records that lack something".to_owned())]),
+        ),
+    );
+    questions.insert(
+        id::present(table),
+        choice(
+            format!("Does the request say outright that the {table} must have something, whatever its value, with words like \"that have\", \"with a\" or \"having\"? If so, what must they have?"),
+            nullable()
+                .map(|field| (field.name.clone(), format!("only {table} that have some `{}`, whatever it is", field.name)))
+                .chain([(NONE.to_owned(), "the request does not say this, which is the usual case".to_owned())]),
+        ),
+    );
+    questions
+}
+
+/// The last request: does the query cover everything that was asked? It
+/// catches a condition that was silently dropped.
+pub(super) fn verification(description: &str) -> Questions {
+    Questions::from([(
+        id::LEFTOVER.to_owned(),
+        noul(format!(
+            "A search was built to answer the request. The search returns: {description}. Does the request ask for a condition, restriction or detail that this search leaves out?"
+        )),
+    )])
 }
 
 /// Asks what one number in the request is for: a field's value, the result
@@ -410,7 +421,7 @@ fn number_role(def: &TableDef, label: &str) -> Question {
 /// none: they are filled from the numbers and the time period.
 fn field_questions(table: &str, field: &Field, found: &Candidates) -> Questions {
     let name = &field.name;
-    let id = id::field(name);
+    let id = id::field(table, name);
     match &field.kind {
         FieldType::Enum { values } => {
             let restricted = enum_options(values).map(|(option, op, value)| {
@@ -439,10 +450,10 @@ fn field_questions(table: &str, field: &Field, found: &Candidates) -> Questions 
                 [
                     (YES, format!("only {table} that are `{name}`")),
                     (
-                        "no",
+                        NO,
                         format!("only {table} that are not `{name}`: non-{name}, not {name}"),
                     ),
-                    (NONE, format!("the request does not mention `{name}`")),
+                    ("none", format!("the request does not mention `{name}`")),
                 ],
             ),
         )]),
@@ -461,7 +472,7 @@ fn field_questions(table: &str, field: &Field, found: &Candidates) -> Questions 
                         ),
                     ),
                     (
-                        NONE,
+                        "none",
                         format!("no, the request does not talk about a `{name}` or about {target}"),
                     ),
                 ],
@@ -475,7 +486,7 @@ fn field_questions(table: &str, field: &Field, found: &Candidates) -> Questions 
                 )),
             ),
             (
-                id::text_match(name),
+                id::text_match(table, name),
                 choice(
                     format!(
                         "How does the request compare the `{name}` of the {table} against a value?"
@@ -484,7 +495,7 @@ fn field_questions(table: &str, field: &Field, found: &Candidates) -> Questions 
                 ),
             ),
             (
-                id::text_value(name),
+                id::text_value(table, name),
                 value_choice(
                     format!(
                         "Which text does the request want the `{name}` of the {table} to match?"
@@ -510,7 +521,7 @@ mod tests {
 
     #[test]
     fn no_phrase_of_a_request_can_be_mistaken_for_none() {
-        let phrases = Candidates::find(&format!("clients named {NONE} please")).phrases;
+        let phrases = Candidates::find(&format!("clients named {NONE} or {NONE}")).phrases;
         assert!(!phrases.iter().any(|phrase| phrase == NONE));
     }
 

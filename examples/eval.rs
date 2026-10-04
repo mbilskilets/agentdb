@@ -17,8 +17,6 @@ use serde_json::Value;
 /// Dollars per input token for Jev.
 const PRICE: f64 = 0.042 / 1e6;
 const LEVELS: [&str; 4] = ["simple", "normal", "hard", "superhard"];
-/// The option the model picks when no other fits.
-const NONE: &str = "none of the above";
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -121,7 +119,9 @@ fn trace(answers: &BTreeMap<String, Answer>) -> String {
         .iter()
         .filter_map(|(id, answer)| match answer {
             Answer::Noul { noul } if *noul >= 0.35 => Some(format!("{id}={noul:.2}")),
-            Answer::Choice { choice, confidence } if choice != NONE || *confidence < 0.7 => {
+            Answer::Choice { choice, confidence }
+                if !choice.starts_with("none") || *confidence < 0.7 =>
+            {
                 Some(format!("{id}={choice}({confidence:.2})"))
             }
             _ => None,

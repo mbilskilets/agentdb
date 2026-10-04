@@ -1,9 +1,9 @@
 //! Turns an English request into a [`Query`].
 //!
 //! The model cannot write a query. This module lists every choice the schema
-//! allows, asks the model to pick, and assembles the picks. It asks in three
-//! small requests: which table, then everything about that table, then
-//! whether the assembled query leaves anything out.
+//! allows, asks the model to pick, and assembles the picks. It asks about
+//! every table in one request when that fits; on a larger schema it first
+//! asks which table the request is about, then asks about that table alone.
 
 mod calendar;
 mod candidates;
@@ -30,8 +30,9 @@ const MIN_CONFIDENCE: f64 = 0.6;
 /// The model accepts 255 options per choice.
 const MAX_OPTIONS: usize = 255;
 /// The model accepts 64k tokens per request, and 32k for the request text
-/// plus its longest question. Text of this size stays under both.
-const MAX_REQUEST_BYTES: usize = 64_000;
+/// plus its longest question. The requests built here come to 2.4 bytes per
+/// token or more, so this many bytes stays under both.
+const MAX_REQUEST_BYTES: usize = 60_000;
 const TOO_LARGE: &str = "ask() could not fit this request and the choices the schema allows into one request to the model. Shorten the request if it is long; otherwise use find() with an explicit query.";
 
 /// The result of [`crate::AgentDb::ask`]. `page` is present only when the
@@ -103,14 +104,25 @@ fn understand(
 ) -> std::result::Result<(), Stop> {
     let found = Candidates::find(text);
 
-    let routing = questions::routing(defs);
-    let answers = consult(judge, text, &routing, &mut plan.usage)?;
-    let mut reader = Reader::new(&routing, &answers, &mut plan.confidence);
+    let general = questions::general(defs, &found);
+    let about_every_table = defs.iter().flat_map(|def| questions::about(def, &found));
+    let everything: Questions = general
+        .clone()
+        .into_iter()
+        .chain(about_every_table)
+        .collect();
+    let everything_fits = fits(text, &everything);
+    let mut asked = if everything_fits { everything } else { general };
+    let mut answers = consult(judge, text, &asked, &mut plan.usage)?;
+    let mut reader = Reader::new(&asked, &answers, &mut plan.confidence);
     let def = interpret::route(defs, &mut reader)?;
 
-    let about = questions::about(def, &found);
-    let answers = consult(judge, text, &about, &mut plan.usage)?;
-    let mut reader = Reader::new(&about, &answers, &mut plan.confidence);
+    if !everything_fits {
+        let about = questions::about(def, &found);
+        answers.extend(consult(judge, text, &about, &mut plan.usage)?);
+        asked.extend(about);
+    }
+    let mut reader = Reader::new(&asked, &answers, &mut plan.confidence);
     let understood = interpret::interpret(def, &mut reader, &found, today)?;
     plan.query = Some(understood.query);
     if plan.confidence < MIN_CONFIDENCE {

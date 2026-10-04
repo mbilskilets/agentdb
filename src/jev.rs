@@ -104,16 +104,7 @@ impl Jev {
             _ => Err(DbError::MissingApiKey),
         }
     }
-}
 
-#[derive(Serialize)]
-struct Request<'a> {
-    state: &'a str,
-    model: &'static str,
-    questions: &'a BTreeMap<String, Question>,
-}
-
-impl Jev {
     fn judge_at(
         &self,
         url: &str,
@@ -137,6 +128,13 @@ impl Jev {
                 other => DbError::Jev(other.to_string()),
             })
     }
+}
+
+#[derive(Serialize)]
+struct Request<'a> {
+    state: &'a str,
+    model: &'static str,
+    questions: &'a BTreeMap<String, Question>,
 }
 
 impl Judge for Jev {

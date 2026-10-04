@@ -12,7 +12,8 @@ use super::calendar::{
 };
 use super::candidates::Candidates;
 use super::questions::{
-    self, ASCENDING, BY_ID, BY_PROPERTY, IS_NOT, ROLE_LIMIT, ROLE_SPAN, UNSUPPORTED, YES, id,
+    self, ASCENDING, BY_ID, BY_PROPERTY, IS_NOT, NO, NO_PERIOD, ROLE_LIMIT, ROLE_SPAN, UNSUPPORTED,
+    YES, id,
 };
 use super::reader::Reader;
 
@@ -61,7 +62,7 @@ pub(super) fn interpret(
     query.limit = numbers.limit;
     for field in &def.fields {
         let by_id = matches!(field.kind, FieldType::Ref { .. })
-            && reader.pick(&id::field(&field.name)) == Some(BY_ID);
+            && reader.pick(&id::field(table, &field.name)) == Some(BY_ID);
         if by_id && !has_filter(&query, &field.name) {
             return Err(unclear(table, &format!("the id for `{}`", field.name)));
         }
@@ -70,7 +71,7 @@ pub(super) fn interpret(
     if let Some(time) = &time {
         query.filters.extend(time.filters.iter().cloned());
     }
-    if let Some(field) = reader.pick(id::MISSING) {
+    if let Some(field) = reader.pick(&id::missing(table)) {
         query.filters.push(filter(field, Op::Eq, Value::Null));
     }
     if let Some(field) = field_that_must_be_set(reader, &query) {
@@ -78,7 +79,7 @@ pub(super) fn interpret(
     }
     if reader.yes(id::SORT) {
         let field = reader
-            .pick(id::SORT_FIELD)
+            .pick(&id::sort_field(table))
             .ok_or_else(|| unclear(table, "the field to order by"))?;
         query.sort = Some(Sort {
             field: field.to_owned(),
@@ -111,7 +112,7 @@ fn unclear(table: &str, part: &str) -> String {
 /// have none: they are filled from the numbers and the time period.
 fn field_filter(reader: &mut Reader<'_>, table: &str, field: &Field) -> Built<Option<Filter>> {
     let name = field.name.as_str();
-    let id = id::field(name);
+    let id = id::field(table, name);
     Ok(match &field.kind {
         FieldType::Enum { values } => {
             let picked = reader.pick(&id);
@@ -119,9 +120,11 @@ fn field_filter(reader: &mut Reader<'_>, table: &str, field: &Field) -> Built<Op
                 .find(|(option, _, _)| Some(option.as_str()) == picked)
                 .map(|(_, op, value)| filter(name, op, Value::from(value)))
         }
-        FieldType::Bool => reader
-            .pick(&id)
-            .map(|picked| filter(name, Op::Eq, Value::Bool(picked == YES))),
+        FieldType::Bool => match reader.pick(&id) {
+            Some(YES) => Some(filter(name, Op::Eq, Value::Bool(true))),
+            Some(NO) => Some(filter(name, Op::Eq, Value::Bool(false))),
+            _ => None,
+        },
         FieldType::Ref { table: target } => {
             if reader.pick(&id) == Some(BY_PROPERTY) {
                 return Err(format!(
@@ -138,16 +141,16 @@ fn field_filter(reader: &mut Reader<'_>, table: &str, field: &Field) -> Built<Op
 /// Text is matched with `contains`. A query has no "does not contain", so a
 /// request to exclude by text is refused rather than run as something else.
 fn text_filter(reader: &mut Reader<'_>, table: &str, name: &str) -> Built<Option<Filter>> {
-    if !reader.yes(&id::field(name)) {
+    if !reader.yes(&id::field(table, name)) {
         return Ok(None);
     }
-    if reader.pick(&id::text_match(name)) == Some(IS_NOT) {
+    if reader.pick(&id::text_match(table, name)) == Some(IS_NOT) {
         return Err(format!(
             "ask() matches text with `contains` and cannot exclude `{table}` by the text of their `{name}`. Use find(): its `ne` operator excludes one exact value."
         ));
     }
     let value = reader
-        .pick(&id::text_value(name))
+        .pick(&id::text_value(table, name))
         .ok_or_else(|| unclear(table, &format!("the text to match `{name}` against")))?;
     Ok(Some(filter(name, Op::Contains, Value::from(value))))
 }
@@ -164,7 +167,7 @@ struct Numbers {
 fn read_numbers(reader: &mut Reader<'_>, def: &TableDef, found: &Candidates) -> Built<Numbers> {
     let mut numbers = Numbers::default();
     for (index, (label, value)) in found.numbers.iter().enumerate() {
-        match reader.pick(&id::number_role(index)) {
+        match reader.pick(&id::number_role(&def.name, index)) {
             None => {}
             Some(ROLE_LIMIT) => {
                 let limit = whole(value).ok_or_else(|| {
@@ -201,11 +204,12 @@ fn whole(value: &Value) -> Option<u32> {
 /// The field the request says must have a value. One that already has a
 /// value filter is known to be set, so the model's answer is not relied on.
 fn field_that_must_be_set<'a>(reader: &mut Reader<'a>, query: &Query) -> Option<&'a str> {
-    let field = reader.peek(id::PRESENT)?;
+    let id = id::present(&query.table);
+    let field = reader.peek(&id)?;
     if has_filter(query, field) {
         return None;
     }
-    reader.pick(id::PRESENT)
+    reader.pick(&id)
 }
 
 /// The request's time condition: the filters it becomes, and the words it
@@ -223,11 +227,14 @@ fn time_condition(
     found: &Candidates,
     today: Date,
 ) -> Built<Option<TimeCondition>> {
-    let Some(period) = reader.pick(id::PERIOD) else {
+    let Some(period) = reader
+        .pick(id::PERIOD)
+        .filter(|period| *period != NO_PERIOD)
+    else {
         return Ok(None);
     };
     let field = reader
-        .pick(id::PERIOD_FIELD)
+        .pick(&id::period_field(table))
         .ok_or_else(|| unclear(table, "which date the time condition applies to"))?;
     let (bounds, phrase) = period_bounds(reader, period, span, found, today)
         .ok_or_else(|| unclear(table, "the time period"))?;
