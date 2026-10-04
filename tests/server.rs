@@ -234,6 +234,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_malformed_url_and_an_unknown_route_get_the_same_error_shape() {
+        let (base, _dir) = start().await;
+        let (status, body) = call(
+            "GET",
+            of(&base, "acme/tables/clients/docs/first"),
+            SECRET,
+            Value::Null,
+        )
+        .await;
+        assert_eq!((status, code(&body)), (400, "invalid_request"));
+        assert!(message(&body).contains("`first`"), "{body}");
+        let (status, body) = call(
+            "GET",
+            of(&base, "acme/changes?since=start"),
+            SECRET,
+            Value::Null,
+        )
+        .await;
+        assert_eq!((status, code(&body)), (400, "invalid_request"));
+        assert!(message(&body).contains("since"), "{body}");
+
+        let (status, body) = call("GET", of(&base, "acme/tables"), SECRET, Value::Null).await;
+        assert_eq!((status, code(&body)), (404, "unknown_route"));
+        assert_eq!(
+            message(&body),
+            "agentdb has no route `GET /v1/tenants/acme/tables`. Tenant routes start with /v1/tenants/{tenant}/ and end in describe, migrate, find, ask, batch, changes, subscribe, tables/{table}/docs or tables/{table}/docs/{id}."
+        );
+        let (status, body) = call("DELETE", of(&base, "acme/describe"), SECRET, Value::Null).await;
+        assert_eq!((status, code(&body)), (405, "unknown_route"));
+        assert!(
+            message(&body).starts_with("agentdb has no route `DELETE /v1/tenants/acme/describe`."),
+            "{body}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn tenant_ids_are_lowercase_so_no_two_share_a_file() {
         let (base, dir) = start().await;
         for id in ["bad.name", "Acme", "ACME"] {

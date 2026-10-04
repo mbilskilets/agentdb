@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Bytes, to_bytes};
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query as UrlQuery, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
@@ -38,6 +38,7 @@ const MAX_BODY_MIB: usize = 8;
 const MAX_BODY_BYTES: usize = MAX_BODY_MIB * 1024 * 1024;
 /// How long requests in flight get to finish once the server is told to stop.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const ROUTES: &str = "Tenant routes start with /v1/tenants/{tenant}/ and end in describe, migrate, find, ask, batch, changes, subscribe, tables/{table}/docs or tables/{table}/docs/{id}.";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -171,7 +172,40 @@ fn router(app: &Arc<App>) -> Router {
         .route("/health", get(|| async { Json(json!({"ok": true})) }))
         .nest("/v1/tenants/{tenant}", tenant_routes)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(middleware::from_fn(in_error_shape))
         .with_state(Arc::clone(app))
+}
+
+/// Puts a refusal that axum wrote itself, for a malformed URL or a route
+/// that does not exist, into the shape every other error has.
+async fn in_error_shape(request: Request, next: Next) -> Response {
+    let route = format!("{} {}", request.method(), request.uri().path());
+    let response = next.run(request).await;
+    let status = response.status();
+    let is_ours = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|kind| kind == "application/json");
+    if !status.is_client_error() || is_ours {
+        return response;
+    }
+    match to_bytes(response.into_body(), MAX_BODY_BYTES).await {
+        Ok(reason) if reason.is_empty() => ApiError::new(
+            status,
+            "unknown_route",
+            format!("agentdb has no route `{route}`. {ROUTES}"),
+        ),
+        Ok(reason) => ApiError::new(
+            status,
+            "invalid_request",
+            format!(
+                "the request is not valid: {}.",
+                String::from_utf8_lossy(&reason)
+            ),
+        ),
+        Err(unreadable) => ApiError::internal(unreadable),
+    }
+    .into_response()
 }
 
 async fn authorize(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
