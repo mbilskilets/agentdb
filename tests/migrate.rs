@@ -697,10 +697,11 @@ mod tests {
         db
     }
 
-    fn all_readings(db: &AgentDb) -> Vec<Doc> {
+    /// Every document the table of [`readings`] holds under the name `table`.
+    fn all_readings(db: &AgentDb, table: &str) -> Vec<Doc> {
         (0..3)
             .flat_map(|page| {
-                let query = Query::table("readings").limit(500).offset(page * 500);
+                let query = Query::table(table).limit(500).offset(page * 500);
                 db.find(&query).unwrap().docs
             })
             .collect()
@@ -710,7 +711,7 @@ mod tests {
     fn renaming_and_removing_a_field_reach_every_document_of_a_large_table() {
         let db = readings();
         db.rename_field("readings", "level", "depth").unwrap();
-        let renamed = all_readings(&db);
+        let renamed = all_readings(&db, "readings");
         assert_eq!(renamed.len(), 1201);
         for doc in &renamed {
             let expected = match doc.id {
@@ -723,9 +724,25 @@ mod tests {
         }
 
         db.remove_field("readings", "depth", true).unwrap();
-        let emptied = all_readings(&db);
+        let emptied = all_readings(&db, "readings");
         assert_eq!(emptied.len(), 1201);
         assert!(emptied.iter().all(|doc| doc.fields.is_empty()));
+    }
+
+    #[test]
+    fn renaming_and_dropping_a_table_reach_every_document_of_a_large_table() {
+        let db = readings();
+        let before = all_readings(&db, "readings");
+        db.rename_table("readings", "levels").unwrap();
+        assert_eq!(all_readings(&db, "levels"), before);
+
+        let emptied = TableDef::new("readings").optional("level", FieldType::Text);
+        db.define_table(&emptied).unwrap();
+        assert_eq!(all_readings(&db, "readings"), []);
+
+        db.drop_table("levels", true).unwrap();
+        db.rename_table("readings", "levels").unwrap();
+        assert_eq!(all_readings(&db, "levels"), []);
     }
 
     #[test]

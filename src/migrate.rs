@@ -396,12 +396,17 @@ fn rename_table(conn: &Connection, table: &str, new_name: &str) -> Result<()> {
         "UPDATE _tables SET name = ?2, schema = ?3 WHERE name = ?1",
         params![table, new_name, to_json(&def)?],
     )?;
-    for renamed in ["docs", "changes"] {
+    in_chunks(conn, table, |after, last| {
         conn.execute(
-            &format!("UPDATE {renamed} SET tbl = ?2 WHERE tbl = ?1"),
-            params![table, new_name],
+            "UPDATE docs SET tbl = ?4 WHERE tbl = ?1 AND id > ?2 AND id <= ?3",
+            params![table, after, last, new_name],
         )?;
-    }
+        Ok(())
+    })?;
+    conn.execute(
+        "UPDATE changes SET tbl = ?2 WHERE tbl = ?1",
+        params![table, new_name],
+    )?;
     conn.execute(
         "INSERT INTO _ids (name, next_id) SELECT ?2, next_id FROM _ids WHERE name = ?1
          ON CONFLICT (name) DO UPDATE SET next_id = max(next_id, excluded.next_id)",
@@ -722,7 +727,13 @@ fn drop_table(conn: &Connection, table: &str, force: bool) -> Result<()> {
             count,
         });
     }
-    conn.execute("DELETE FROM docs WHERE tbl = ?1", [table])?;
+    in_chunks(conn, table, |after, last| {
+        conn.execute(
+            "DELETE FROM docs WHERE tbl = ?1 AND id > ?2 AND id <= ?3",
+            params![table, after, last],
+        )?;
+        Ok(())
+    })?;
     conn.execute("DELETE FROM _tables WHERE name = ?1", [table])?;
     Ok(())
 }
