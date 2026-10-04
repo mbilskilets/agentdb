@@ -1,9 +1,14 @@
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
+    use std::path::Path;
 
-    use agentdb::{AgentDb, ChangeKind, DbError, Field, FieldType, Op, Query, TableDef};
+    use agentdb::{
+        AgentDb, Change, ChangeKind, DbError, Field, FieldType, Op, Query, TableDef, Write,
+    };
     use serde_json::json;
+    use tokio::sync::broadcast::Receiver;
+    use tokio::sync::broadcast::error::TryRecvError;
 
     fn crm() -> AgentDb {
         let db = AgentDb::open_in_memory().unwrap();
@@ -59,6 +64,10 @@ mod tests {
             "clients",
             json!({"name": "Acme Labs", "status": "active", "revenue": 4000, "signed_at": "2026-10-03T09:00:00+02:00"}),
         ).unwrap();
+    }
+
+    fn drain(live: &mut Receiver<Change>) -> Vec<Change> {
+        std::iter::from_fn(|| live.try_recv().ok()).collect()
     }
 
     fn names(db: &AgentDb, query: &Query) -> Vec<String> {
@@ -149,11 +158,11 @@ mod tests {
             .insert("clients", json!({"name": "Ann", "company": company.id}))
             .unwrap();
         assert_eq!(
-            message(db.delete("companies", company.id)),
+            message(db.delete("companies", company.id, None)),
             "cannot delete `companies` id 1: 1 document(s) in `clients` point to it through `company`. Update or delete those first."
         );
-        db.delete("clients", client.id).unwrap();
-        db.delete("companies", company.id).unwrap();
+        db.delete("clients", client.id, None).unwrap();
+        db.delete("companies", company.id, None).unwrap();
     }
 
     #[test]
@@ -186,15 +195,138 @@ mod tests {
             .unwrap();
         assert_eq!(
             message(db.update("clients", 1, json!({"revenue": 2}), Some(1))),
-            "`clients` id 1 is at version 2, but the update expected version 1. Someone else changed it: read it again with get() and retry with version 2."
+            "`clients` id 1 is at version 2, but this write expected version 1. Someone else changed it: read it again with get() and retry with version 2."
         );
+    }
+
+    #[test]
+    fn delete_refuses_a_stale_version() {
+        let db = crm();
+        db.insert("clients", json!({"name": "Acme"})).unwrap();
+        db.update("clients", 1, json!({"revenue": 1}), None)
+            .unwrap();
+        assert_eq!(
+            message(db.delete("clients", 1, Some(1))),
+            "`clients` id 1 is at version 2, but this write expected version 1. Someone else changed it: read it again with get() and retry with version 2."
+        );
+        assert_eq!(db.get("clients", 1).unwrap().version, 2);
+        db.delete("clients", 1, Some(2)).unwrap();
+        assert!(matches!(
+            db.get("clients", 1),
+            Err(DbError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn a_batch_applies_every_write_in_order() {
+        let db = crm();
+        let mut live = db.subscribe();
+        let writes: Vec<Write> = serde_json::from_value(json!([
+            {"op": "insert", "table": "companies", "doc": {"name": "Acme Corp"}},
+            {"op": "insert", "table": "clients", "doc": {"name": "Ann", "company": 1}},
+            {"op": "update", "table": "clients", "id": 1, "patch": {"revenue": 5}, "version": 1},
+            {"op": "insert", "table": "clients", "doc": {"name": "Bob"}},
+            {"op": "delete", "table": "clients", "id": 2},
+        ]))
+        .unwrap();
+        let docs = db.batch(writes).unwrap();
+        let summary: Vec<_> = docs
+            .iter()
+            .map(|doc| (doc.id, doc.version, doc.fields["name"].clone()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (1, 1, json!("Acme Corp")),
+                (1, 1, json!("Ann")),
+                (1, 2, json!("Ann")),
+                (2, 1, json!("Bob")),
+                (2, 1, json!("Bob")),
+            ]
+        );
+        assert_eq!(docs[2].fields["revenue"], 5);
+        assert_eq!(db.get("clients", 1).unwrap(), docs[2]);
+        assert!(matches!(
+            db.get("clients", 2),
+            Err(DbError::NotFound { .. })
+        ));
+
+        let published = drain(&mut live);
+        let kinds: Vec<_> = published.iter().map(|change| change.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ChangeKind::Insert,
+                ChangeKind::Insert,
+                ChangeKind::Update,
+                ChangeKind::Insert,
+                ChangeKind::Delete
+            ]
+        );
+        let published_docs: Vec<_> = published.into_iter().filter_map(|c| c.doc).collect();
+        assert_eq!(published_docs, docs);
+    }
+
+    #[test]
+    fn a_batch_with_a_failing_write_changes_nothing() {
+        let db = crm();
+        db.insert("clients", json!({"name": "Acme"})).unwrap();
+        let before = db.latest_seq().unwrap();
+        let mut live = db.subscribe();
+        let insert = |doc| Write::Insert {
+            table: "clients".to_owned(),
+            doc,
+        };
+        let writes = vec![
+            insert(json!({"name": "Globex"})),
+            Write::Update {
+                table: "clients".to_owned(),
+                id: 1,
+                patch: json!({"revenue": 9}),
+                version: None,
+            },
+            insert(json!({"name": "Initech", "company": 77})),
+        ];
+        assert_eq!(
+            message(db.batch(writes)),
+            "step 3 of 3 failed, so none of the 3 changes were applied: field `company` points to `companies` id 77, which does not exist. Insert that `companies` document first or use an existing id."
+        );
+        assert_eq!(db.find(&Query::table("clients")).unwrap().total, 1);
+        assert_eq!(db.get("clients", 1).unwrap().version, 1);
+        assert_eq!(db.latest_seq().unwrap(), before);
+        assert_eq!(drain(&mut live), []);
+        assert_eq!(
+            db.insert("clients", json!({"name": "Hooli"})).unwrap().id,
+            2
+        );
+    }
+
+    #[test]
+    fn a_batch_is_limited_to_500_writes() {
+        let db = crm();
+        let writes = |count: usize| {
+            vec![
+                Write::Insert {
+                    table: "clients".to_owned(),
+                    doc: json!({"name": "Acme"}),
+                };
+                count
+            ]
+        };
+        assert_eq!(
+            message(db.batch(writes(501))),
+            "a batch takes at most 500 writes, and this one has 501. Split it into batches of 500 or fewer and send them one after another."
+        );
+        assert_eq!(db.find(&Query::table("clients")).unwrap().total, 0);
+        assert_eq!(db.batch(writes(500)).unwrap().len(), 500);
+        assert_eq!(db.batch(Vec::new()).unwrap(), []);
     }
 
     #[test]
     fn ids_are_not_reused_after_delete() {
         let db = crm();
         db.insert("clients", json!({"name": "Acme"})).unwrap();
-        db.delete("clients", 1).unwrap();
+        db.delete("clients", 1, None).unwrap();
         assert_eq!(
             db.insert("clients", json!({"name": "Globex"})).unwrap().id,
             2
@@ -358,14 +490,14 @@ mod tests {
         assert_eq!(schema_kinds, [ChangeKind::Schema, ChangeKind::Schema]);
         let start = setup.last().map_or(0, |change| change.seq);
 
-        let live = db.subscribe().unwrap();
+        let mut live = db.subscribe();
         db.insert("clients", json!({"name": "Acme"})).unwrap();
         db.update("clients", 1, json!({"revenue": 5}), None)
             .unwrap();
-        db.delete("clients", 1).unwrap();
+        db.delete("clients", 1, None).unwrap();
         db.insert("clients", json!({"nope": 1})).unwrap_err();
 
-        let received: Vec<_> = live.try_iter().collect();
+        let received = drain(&mut live);
         let kinds: Vec<_> = received.iter().map(|change| change.kind).collect();
         assert_eq!(
             kinds,
@@ -379,6 +511,79 @@ mod tests {
             last.map(|doc| doc.fields["revenue"].clone()),
             Some(json!(5))
         );
+    }
+
+    #[test]
+    fn a_subscriber_that_falls_behind_is_told_and_catches_up_from_the_log() {
+        let db = crm();
+        let start = db.latest_seq().unwrap();
+        let mut live = db.subscribe();
+        for _ in 0..3 {
+            let writes = vec![
+                Write::Insert {
+                    table: "clients".to_owned(),
+                    doc: json!({"name": "Acme"}),
+                };
+                500
+            ];
+            db.batch(writes).unwrap();
+        }
+        assert!(matches!(live.try_recv(), Err(TryRecvError::Lagged(_))));
+
+        let mut caught_up = Vec::new();
+        loop {
+            let from = caught_up.last().map_or(start, |change: &Change| change.seq);
+            let page = db.changes_since(from).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            caught_up.extend(page);
+        }
+        assert_eq!(caught_up.len(), 1500);
+        assert_eq!(caught_up.last().unwrap().seq, db.latest_seq().unwrap());
+    }
+
+    #[test]
+    fn the_change_log_keeps_only_the_newest_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tenant.db");
+        let db = AgentDb::open(&path, "key").unwrap();
+        assert_eq!(db.latest_seq().unwrap(), 0);
+        assert_eq!(db.changes_since(0).unwrap(), []);
+        db.define_table(&TableDef::new("notes").required("text", FieldType::Text))
+            .unwrap();
+        for _ in 0..21 {
+            let writes = vec![
+                Write::Insert {
+                    table: "notes".to_owned(),
+                    doc: json!({"text": "hello"}),
+                };
+                500
+            ];
+            db.batch(writes).unwrap();
+        }
+        assert_eq!(db.latest_seq().unwrap(), 10_501);
+        assert_eq!(
+            message(db.changes_since(0)),
+            "cannot replay changes after seq 0: the log keeps only the newest 10000 changes, and the oldest one left is seq 502. Read the current state with find() instead, then continue from seq 10501."
+        );
+        assert!(matches!(
+            db.changes_since(500),
+            Err(DbError::ChangesTrimmed { .. })
+        ));
+        let oldest_kept = db.changes_since(501).unwrap();
+        assert_eq!(oldest_kept.len(), 500);
+        assert_eq!(oldest_kept[0].seq, 502);
+        assert_eq!(db.changes_since(10_501).unwrap(), []);
+
+        drop(db);
+        let reopened = AgentDb::open(&path, "key").unwrap();
+        assert_eq!(reopened.latest_seq().unwrap(), 10_501);
+        assert!(matches!(
+            reopened.changes_since(0),
+            Err(DbError::ChangesTrimmed { .. })
+        ));
+        assert_eq!(reopened.changes_since(10_500).unwrap().len(), 1);
     }
 
     #[test]
@@ -413,6 +618,26 @@ mod tests {
         );
     }
 
+    /// Whether any file in `dir` holds `needle` as plain bytes.
+    fn leaked(dir: &Path, needle: &[u8]) -> bool {
+        std::fs::read_dir(dir).unwrap().any(|entry| {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            bytes.windows(needle.len()).any(|window| window == needle)
+        })
+    }
+
+    #[test]
+    fn nothing_on_disk_is_readable_while_the_database_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = AgentDb::open(dir.path().join("tenant.db"), "correct horse").unwrap();
+        define_crm(&db);
+        db.insert("clients", json!({"name": "Acme Secret Client"}))
+            .unwrap();
+        assert!(std::fs::read_dir(dir.path()).unwrap().count() > 1);
+        assert!(!leaked(dir.path(), b"Acme Secret Client"));
+        assert!(!leaked(dir.path(), b"clients"));
+    }
+
     #[test]
     fn file_is_encrypted_and_needs_the_right_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -423,10 +648,8 @@ mod tests {
             db.insert("clients", json!({"name": "Acme Secret Client"}))
                 .unwrap();
         }
-        let bytes = std::fs::read(&path).unwrap();
-        let leaked = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
-        assert!(!leaked(b"Acme Secret Client"));
-        assert!(!leaked(b"SQLite format"));
+        assert!(!leaked(dir.path(), b"Acme Secret Client"));
+        assert!(!leaked(dir.path(), b"SQLite format"));
 
         assert!(matches!(
             AgentDb::open(&path, "wrong key"),

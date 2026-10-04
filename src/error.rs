@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::db::RETAINED_CHANGES;
+
 pub type Result<T> = std::result::Result<T, DbError>;
 
 /// Every message names what was wrong and what a correct call looks like,
@@ -52,7 +54,7 @@ pub enum DbError {
     NotFound { table: String, id: i64 },
 
     #[error(
-        "`{table}` id {id} is at version {actual}, but the update expected version {expected}. Someone else changed it: read it again with get() and retry with version {actual}."
+        "`{table}` id {id} is at version {actual}, but this write expected version {expected}. Someone else changed it: read it again with get() and retry with version {actual}."
     )]
     VersionConflict {
         table: String,
@@ -188,6 +190,21 @@ pub enum DbError {
         source: Box<Self>,
     },
 
+    #[error(
+        "a batch takes at most {max} writes, and this one has {size}. Split it into batches of {max} or fewer and send them one after another."
+    )]
+    BatchTooLarge { size: usize, max: usize },
+
+    #[error(
+        "cannot replay changes after seq {since}: the log keeps only the newest {} changes, and the oldest one left is seq {oldest}. Read the current state with find() instead, then continue from seq {latest}.",
+        RETAINED_CHANGES
+    )]
+    ChangesTrimmed {
+        since: i64,
+        oldest: i64,
+        latest: i64,
+    },
+
     #[error("the encryption key must not be empty.")]
     EmptyKey,
 
@@ -252,9 +269,25 @@ impl DbError {
             Self::InvalidTimestamp { .. } => "invalid_timestamp",
             Self::MissingApiKey => "missing_api_key",
             Self::StepFailed { source, .. } => source.code(),
+            Self::BatchTooLarge { .. } => "batch_too_large",
+            Self::ChangesTrimmed { .. } => "changes_trimmed",
             Self::Jev(_) => "model_unavailable",
             Self::Storage(_) => "storage",
             Self::Internal(_) => "internal",
+        }
+    }
+
+    /// Says which step of a multi-step migration or batch failed. A single
+    /// step keeps its own error.
+    pub(crate) fn at_step(self, step: usize, of: usize) -> Self {
+        if of > 1 {
+            Self::StepFailed {
+                step,
+                of,
+                source: Box::new(self),
+            }
+        } else {
+            self
         }
     }
 }

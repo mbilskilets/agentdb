@@ -5,9 +5,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::Write;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query as UrlQuery, Request, State};
@@ -23,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::spawn_blocking;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
@@ -31,8 +29,6 @@ use tokio_stream::{Stream, StreamExt};
 use crate::{AgentDb, Change, DbError, Jev, Query, SchemaChange};
 
 const MAX_TENANT_LEN: usize = 64;
-/// How often an idle subscription checks whether its client has gone away.
-const DISCONNECT_CHECK: Duration = Duration::from_secs(1);
 const SUBSCRIBER_BUFFER: usize = 256;
 
 #[derive(Debug, Clone)]
@@ -356,7 +352,7 @@ async fn delete(
     Path((tenant, table, id)): Path<(String, String, i64)>,
 ) -> Api<Value> {
     with_tenant(app, tenant, move |db, _| {
-        db.delete(&table, id)?;
+        db.delete(&table, id, None)?;
         Ok(json!({"deleted": true}))
     })
     .await
@@ -374,7 +370,7 @@ async fn subscribe(
     let (live, replay) = spawn_blocking(move || {
         let db = app.tenant(&tenant)?;
         // Subscribe before reading the backlog so nothing falls in between.
-        let live = db.subscribe()?;
+        let live = db.subscribe();
         let replay = match since.since {
             Some(seq) => backlog(&db, seq)?,
             None => Vec::new(),
@@ -383,7 +379,7 @@ async fn subscribe(
     })
     .await
     .map_err(ApiError::internal)??;
-    spawn_blocking(move || forward(replay, &live, &sender));
+    tokio::spawn(forward(replay, live, sender));
     let events = ReceiverStream::new(receiver).map(|change| {
         let data = serde_json::to_string(&change).unwrap_or_default();
         Ok(Event::default().id(change.seq.to_string()).data(data))
@@ -403,24 +399,33 @@ fn backlog(db: &AgentDb, since: i64) -> Result<Vec<Change>, DbError> {
     }
 }
 
-/// Sends the backlog, then live changes, until the client disconnects.
-fn forward(replay: Vec<Change>, live: &Receiver<Change>, sender: &mpsc::Sender<Change>) {
+/// Sends the backlog, then live changes, until the client disconnects or
+/// falls too far behind to follow.
+async fn forward(
+    replay: Vec<Change>,
+    mut live: broadcast::Receiver<Change>,
+    sender: mpsc::Sender<Change>,
+) {
     let mut last = 0;
     for change in replay {
         last = change.seq;
-        if sender.blocking_send(change).is_err() {
+        if sender.send(change).await.is_err() {
             return;
         }
     }
     loop {
-        match live.recv_timeout(DISCONNECT_CHECK) {
+        let received = tokio::select! {
+            () = sender.closed() => return,
+            received = live.recv() => received,
+        };
+        match received {
             Ok(change) if change.seq > last => {
-                if sender.blocking_send(change).is_err() {
+                if sender.send(change).await.is_err() {
                     return;
                 }
             }
-            Err(error) if error == RecvTimeoutError::Disconnected || sender.is_closed() => return,
-            Ok(_) | Err(_) => {}
+            Ok(_) => {}
+            Err(_) => return,
         }
     }
 }

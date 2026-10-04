@@ -12,6 +12,7 @@ mod migrate;
 mod query;
 mod schema;
 pub mod server;
+mod write;
 
 pub use ask::Asked;
 pub use change::{Change, ChangeKind};
@@ -21,3 +22,4 @@ pub use jev::{Answer, Jev, Judge, Judgement, Question, Usage};
 pub use migrate::SchemaChange;
 pub use query::{Filter, Op, Query, Sort};
 pub use schema::{Field, FieldType, TableDef};
+pub use write::Write;

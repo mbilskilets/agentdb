@@ -3,9 +3,10 @@ mod tests {
     use std::fmt::Debug;
 
     use agentdb::{
-        AgentDb, ChangeKind, DbError, Field, FieldType, Op, Query, SchemaChange, TableDef,
+        AgentDb, Change, ChangeKind, DbError, Field, FieldType, Op, Query, SchemaChange, TableDef,
     };
     use serde_json::json;
+    use tokio::sync::broadcast::Receiver;
 
     fn crm() -> AgentDb {
         let db = AgentDb::open_in_memory().unwrap();
@@ -39,6 +40,10 @@ mod tests {
         .unwrap();
         db.insert("clients", json!({"name": "Globex"})).unwrap();
         db
+    }
+
+    fn drain(live: &mut Receiver<Change>) -> Vec<Change> {
+        std::iter::from_fn(|| live.try_recv().ok()).collect()
     }
 
     fn message<T: Debug>(result: agentdb::Result<T>) -> String {
@@ -90,7 +95,7 @@ mod tests {
             "field `company` points to `accounts` id 9, which does not exist. Insert that `accounts` document first or use an existing id."
         );
         assert!(matches!(
-            db.delete("accounts", 1),
+            db.delete("accounts", 1, None),
             Err(DbError::StillReferenced { .. })
         ));
         assert!(matches!(
@@ -221,12 +226,12 @@ mod tests {
     #[test]
     fn schema_changes_reach_subscribers_and_failed_ones_do_not() {
         let db = crm();
-        let live = db.subscribe().unwrap();
+        let mut live = db.subscribe();
         db.rename_field("clients", "mail", "email").unwrap();
         db.remove_field("clients", "email", false).unwrap_err();
         db.rename_table("clients", "customers").unwrap();
-        let seen: Vec<_> = live
-            .try_iter()
+        let seen: Vec<_> = drain(&mut live)
+            .into_iter()
             .map(|change| (change.kind, change.table, change.doc))
             .collect();
         assert_eq!(
@@ -310,7 +315,7 @@ mod tests {
         db.change_field_type("clients", "parent", to_missing_company)
             .unwrap();
         assert!(matches!(
-            db.delete("companies", 1),
+            db.delete("companies", 1, None),
             Err(DbError::StillReferenced { .. })
         ));
     }
@@ -388,7 +393,7 @@ mod tests {
     #[test]
     fn a_batch_applies_fully_or_not_at_all() {
         let db = crm();
-        let live = db.subscribe().unwrap();
+        let mut live = db.subscribe();
         let rename = |field: &str, new_name: &str| SchemaChange::RenameField {
             table: "clients".to_owned(),
             field: field.to_owned(),
@@ -414,7 +419,7 @@ mod tests {
         assert_eq!(acme.fields.get("email"), None);
         db.insert("clients", json!({"name": "New", "phone": "555"}))
             .unwrap_err();
-        assert_eq!(live.try_iter().count(), 0);
+        assert_eq!(drain(&mut live), []);
 
         let working = [
             rename("mail", "email"),
@@ -435,7 +440,8 @@ mod tests {
             Err(DbError::UnknownTable { .. })
         ));
         assert_eq!(
-            live.try_iter()
+            drain(&mut live)
+                .iter()
                 .filter(|change| change.kind == ChangeKind::Schema)
                 .count(),
             3

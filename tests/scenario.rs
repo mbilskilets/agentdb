@@ -1,10 +1,14 @@
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
-    use agentdb::{AgentDb, Change, ChangeKind, DbError, Op, Query, SchemaChange};
+    use agentdb::{
+        AgentDb, Change, ChangeKind, DbError, FieldType, Op, Query, SchemaChange, TableDef, Write,
+    };
     use serde_json::json;
+    use tokio::sync::broadcast::Receiver;
 
     const AGENTS: i64 = 4;
     const PER_AGENT: i64 = 50;
@@ -76,6 +80,10 @@ mod tests {
         assert!(events.windows(2).all(|pair| pair[0].seq + 1 == pair[1].seq));
     }
 
+    fn drain(live: &mut Receiver<Change>) -> Vec<Change> {
+        std::iter::from_fn(|| live.try_recv().ok()).collect()
+    }
+
     fn replay(db: &AgentDb) -> Vec<Change> {
         let mut replayed: Vec<Change> = Vec::new();
         loop {
@@ -88,6 +96,128 @@ mod tests {
         }
     }
 
+    /// Two handles on one file stand in for two server processes.
+    #[test]
+    fn two_processes_write_one_file_without_losing_an_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tenant.db");
+        let first = AgentDb::open(&path, "tenant secret").unwrap();
+        setup(&first);
+        let owner = first
+            .insert("employees", json!({"name": "Anna"}))
+            .unwrap()
+            .id;
+        let second = AgentDb::open(&path, "tenant secret").unwrap();
+
+        thread::scope(|scope| {
+            for (agent, db) in [(0, &first), (1, &second)] {
+                scope.spawn(move || insert_clients(db, agent, owner));
+            }
+        });
+        let all = second.find(&Query::table("clients").limit(500)).unwrap();
+        let ids: Vec<i64> = all.docs.iter().map(|doc| doc.id).collect();
+        assert_eq!(ids, (1..=2 * PER_AGENT).collect::<Vec<_>>());
+
+        let outcomes = thread::scope(|scope| {
+            let racers = [&first, &second]
+                .map(|db| scope.spawn(|| db.update("clients", 1, json!({"revenue": 1}), Some(1))));
+            racers.map(|racer| racer.join().unwrap())
+        });
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert!(
+            outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, Err(DbError::VersionConflict { actual: 2, .. })))
+        );
+        assert!(matches!(
+            first.delete("clients", 1, Some(1)),
+            Err(DbError::VersionConflict { actual: 2, .. })
+        ));
+        assert_eq!(second.get("clients", 1).unwrap().version, 2);
+    }
+
+    fn balances(db: &AgentDb) -> Vec<i64> {
+        let tables = db.describe().unwrap();
+        let [table] = tables.as_slice() else {
+            panic!("expected exactly one table, got {tables:?}");
+        };
+        let field = table.fields[0].name.clone();
+        let expected = if table.name == "accounts" {
+            "balance"
+        } else {
+            "amount"
+        };
+        assert_eq!(field, expected);
+        db.find(&Query::table(&table.name))
+            .map(|page| {
+                page.docs
+                    .iter()
+                    .map(|doc| doc.fields[&field].as_i64().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn move_money_and_reshape(db: &AgentDb, round: i64) {
+        let (table, field, new_table, new_field) = if round % 2 == 0 {
+            ("accounts", "balance", "ledgers", "amount")
+        } else {
+            ("ledgers", "amount", "accounts", "balance")
+        };
+        let set = |id, value: i64| Write::Update {
+            table: table.to_owned(),
+            id,
+            patch: json!({field: value}),
+            version: None,
+        };
+        db.batch(vec![set(1, 100 - round), set(2, round)]).unwrap();
+        let changes: Vec<SchemaChange> = serde_json::from_value(json!([
+            {"op": "rename_field", "table": table, "field": field, "new_name": new_field},
+            {"op": "rename_table", "table": table, "new_name": new_table},
+        ]))
+        .unwrap();
+        db.migrate(&changes).unwrap();
+    }
+
+    /// Reads until told to stop and returns how many reads it made.
+    fn read_until_stopped(db: &AgentDb, writing: &AtomicBool) -> u32 {
+        let mut reads = 0;
+        while writing.load(Ordering::Relaxed) {
+            let seen = balances(db);
+            assert!(
+                seen.is_empty() || seen.iter().sum::<i64>() == 100,
+                "{seen:?}"
+            );
+            reads += 1;
+        }
+        reads
+    }
+
+    /// A reader runs while a writer moves money between two accounts in a
+    /// batch and renames the table and its field in a migration. Whatever
+    /// the reader sees, it is a state from before or after a whole write.
+    #[test]
+    fn readers_never_see_half_of_a_batch_or_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = AgentDb::open(dir.path().join("tenant.db"), "tenant secret").unwrap();
+        db.define_table(&TableDef::new("accounts").required("balance", FieldType::Number))
+            .unwrap();
+        db.insert("accounts", json!({"balance": 100})).unwrap();
+        db.insert("accounts", json!({"balance": 0})).unwrap();
+
+        let writing = AtomicBool::new(true);
+        let reads = thread::scope(|scope| {
+            let reader = scope.spawn(|| read_until_stopped(&db, &writing));
+            for round in 0..40 {
+                move_money_and_reshape(&db, round);
+            }
+            writing.store(false, Ordering::Relaxed);
+            reader.join().unwrap()
+        });
+        assert!(reads > 0);
+        assert_eq!(balances(&db), [61, 39]);
+    }
+
     /// Several agents share one tenant database: they write at the same
     /// time, race on one document, reshape a table, and the file is reopened.
     #[test]
@@ -96,7 +226,7 @@ mod tests {
         let path = dir.path().join("tenant.db");
         let db = Arc::new(AgentDb::open(&path, "tenant secret").unwrap());
         setup(&db);
-        let live = db.subscribe().unwrap();
+        let mut live = db.subscribe();
 
         let owner = db.insert("employees", json!({"name": "Anna"})).unwrap().id;
         concurrently(&db, move |db, agent| insert_clients(db, agent, owner));
@@ -119,11 +249,11 @@ mod tests {
             .unwrap();
         assert_eq!(big.total, AGENTS);
         assert!(matches!(
-            db.delete("employees", owner),
+            db.delete("employees", owner, None),
             Err(DbError::StillReferenced { .. })
         ));
 
-        let events: Vec<_> = live.try_iter().collect();
+        let events = drain(&mut live);
         check_events(&events);
         let last_seq = events.last().unwrap().seq;
         drop(live);

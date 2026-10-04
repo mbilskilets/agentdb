@@ -87,19 +87,17 @@ impl AgentDb {
     /// The failing step's error. With more than one change it is wrapped in
     /// [`DbError::StepFailed`], which says which step it was.
     pub fn migrate(&self, changes: &[SchemaChange]) -> Result<()> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        let at = self.timestamp()?;
-        let mut events = Vec::new();
-        for (index, change) in changes.iter().enumerate() {
-            let table = apply(&tx, change)
-                .map_err(|source| step_error(index + 1, changes.len(), source))?;
-            events.push(record(&tx, ChangeKind::Schema, &table, at.clone(), None)?);
-        }
-        tx.commit()?;
-        for event in &events {
-            self.publish(event);
-        }
+        self.write(|conn, at| {
+            changes
+                .iter()
+                .enumerate()
+                .map(|(index, change)| {
+                    let table = apply(conn, change)
+                        .map_err(|source| source.at_step(index + 1, changes.len()))?;
+                    record(conn, ChangeKind::Schema, &table, at, None)
+                })
+                .collect()
+        })?;
         Ok(())
     }
 
@@ -235,20 +233,6 @@ impl AgentDb {
             table: table.to_owned(),
             force,
         }])
-    }
-}
-
-/// Says which step of a multi-step migration failed. A single change keeps
-/// its own error.
-fn step_error(step: usize, of: usize, source: DbError) -> DbError {
-    if of > 1 {
-        DbError::StepFailed {
-            step,
-            of,
-            source: Box::new(source),
-        }
-    } else {
-        source
     }
 }
 
