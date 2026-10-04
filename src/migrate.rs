@@ -16,8 +16,10 @@ use crate::error::{DbError, Result};
 use crate::index;
 use crate::schema::{Field, FieldType, TableDef, check_enum_value, check_name, validate_field};
 
-/// How many values a type change holds in memory at a time.
-const CONVERTED_AT_ONCE: i64 = 500;
+/// How many documents a schema change reads or rewrites at a time. Until a
+/// statement ends, SQLite keeps what the statement overwrote in memory, so a
+/// single statement over a whole table needs memory in proportion to it.
+const DOCS_PER_CHUNK: i64 = 500;
 
 /// One change to the schema. Pass several to [`AgentDb::migrate`] to apply
 /// them as a unit.
@@ -425,12 +427,14 @@ fn rename_field(conn: &Connection, table: &str, field: &str, new_name: &str) -> 
     new_name.clone_into(&mut target.name);
     validate_field(target)?;
     save_def(conn, &mut def)?;
-    conn.execute(
-        "UPDATE docs SET body = json_set(json_remove(body, ?2), ?3, body -> ?2)
-         WHERE tbl = ?1 AND json_type(body, ?2) IS NOT NULL",
-        params![table, json_path(field), json_path(new_name)],
-    )?;
-    Ok(())
+    in_chunks(conn, table, |after, last| {
+        conn.execute(
+            "UPDATE docs SET body = json_set(json_remove(body, ?4), ?5, body -> ?4)
+             WHERE tbl = ?1 AND id > ?2 AND id <= ?3 AND json_type(body, ?4) IS NOT NULL",
+            params![table, after, last, json_path(field), json_path(new_name)],
+        )?;
+        Ok(())
+    })
 }
 
 fn change_type(conn: &Connection, table: &str, field: &str, to: &FieldType) -> Result<()> {
@@ -443,14 +447,8 @@ fn change_type(conn: &Connection, table: &str, field: &str, to: &FieldType) -> R
     save_def(conn, &mut def)?;
     let mut misfits = 0;
     let mut first_misfit = None;
-    let mut converted_up_to = 0;
-    loop {
-        let values = values_after(conn, table, field, converted_up_to)?;
-        let Some((last_id, _)) = values.last() else {
-            break;
-        };
-        converted_up_to = *last_id;
-        for (id, value) in values {
+    in_chunks(conn, table, |after, last| {
+        for (id, value) in values_between(conn, table, field, after, last)? {
             if let Some(converted) = convert(conn, table, field, to, &value)? {
                 store_value(conn, table, field, id, &converted)?;
             } else {
@@ -458,7 +456,8 @@ fn change_type(conn: &Connection, table: &str, field: &str, to: &FieldType) -> R
                 first_misfit.get_or_insert((id, value));
             }
         }
-    }
+        Ok(())
+    })?;
     match first_misfit {
         None if unique => check_no_duplicates(conn, table, field),
         None => Ok(()),
@@ -473,23 +472,23 @@ fn change_type(conn: &Connection, table: &str, field: &str, to: &FieldType) -> R
     }
 }
 
-/// The next values of `field` in id order, from the documents after the one
-/// with id `after` that hold one.
-fn values_after(
+/// The values of `field` in the documents with an id after `after` and up
+/// to `last` that hold one, in id order.
+fn values_between(
     conn: &Connection,
     table: &str,
     field: &str,
     after: i64,
+    last: i64,
 ) -> Result<Vec<(i64, Value)>> {
     conn.prepare(
-        "SELECT id, body -> ?2 FROM docs
-         WHERE tbl = ?1 AND id > ?3 AND json_type(body, ?2) IS NOT NULL
-         ORDER BY id LIMIT ?4",
+        "SELECT id, body -> ?4 FROM docs
+         WHERE tbl = ?1 AND id > ?2 AND id <= ?3 AND json_type(body, ?4) IS NOT NULL
+         ORDER BY id",
     )?
-    .query_map(
-        params![table, json_path(field), after, CONVERTED_AT_ONCE],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-    )?
+    .query_map(params![table, after, last, json_path(field)], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?
     .map(|row| {
         let (id, value) = row?;
         Ok((id, from_json(&value)?))
@@ -692,12 +691,14 @@ fn remove_field(conn: &Connection, table: &str, field: &str, force: bool) -> Res
     }
     def.fields.retain(|existing| existing.name != field);
     save_def(conn, &mut def)?;
-    conn.execute(
-        "UPDATE docs SET body = json_remove(body, ?2)
-         WHERE tbl = ?1 AND json_type(body, ?2) IS NOT NULL",
-        params![table, json_path(field)],
-    )?;
-    Ok(())
+    in_chunks(conn, table, |after, last| {
+        conn.execute(
+            "UPDATE docs SET body = json_remove(body, ?4)
+             WHERE tbl = ?1 AND id > ?2 AND id <= ?3 AND json_type(body, ?4) IS NOT NULL",
+            params![table, after, last, json_path(field)],
+        )?;
+        Ok(())
+    })
 }
 
 fn drop_table(conn: &Connection, table: &str, force: bool) -> Result<()> {
@@ -763,6 +764,32 @@ fn count_set(conn: &Connection, table: &str, field: &str) -> Result<i64> {
             index::value_of(field)
         ),
         [table],
+        |row| row.get(0),
+    )?)
+}
+
+/// Calls `change` for one chunk of the table's documents after another, in
+/// id order, with the id the chunk starts after and the id it ends at.
+fn in_chunks(
+    conn: &Connection,
+    table: &str,
+    mut change: impl FnMut(i64, i64) -> Result<()>,
+) -> Result<()> {
+    let mut after = 0;
+    while let Some(last) = end_of_chunk(conn, table, after)? {
+        change(after, last)?;
+        after = last;
+    }
+    Ok(())
+}
+
+/// The id of the last of the next [`DOCS_PER_CHUNK`] documents after the id
+/// `after`, or `None` when no document follows it.
+fn end_of_chunk(conn: &Connection, table: &str, after: i64) -> Result<Option<i64>> {
+    Ok(conn.query_row(
+        "SELECT max(id) FROM
+         (SELECT id FROM docs WHERE tbl = ?1 AND id > ?2 ORDER BY id LIMIT ?3)",
+        params![table, after, DOCS_PER_CHUNK],
         |row| row.get(0),
     )?)
 }

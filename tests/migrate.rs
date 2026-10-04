@@ -3,8 +3,8 @@ mod tests {
     use std::fmt::Debug;
 
     use agentdb::{
-        AgentDb, Change, ChangeKind, DbError, Field, FieldType, Op, Query, SchemaChange, TableDef,
-        Write,
+        AgentDb, Change, ChangeKind, DbError, Doc, Field, FieldType, Op, Query, SchemaChange,
+        TableDef, Write,
     };
     use serde_json::json;
     use tokio::sync::broadcast::Receiver;
@@ -671,8 +671,8 @@ mod tests {
         ));
     }
 
-    /// More documents than a type change converts at a time, so the change
-    /// has to carry on from where the last batch of values ended.
+    /// More documents than a schema change rewrites at a time, so the change
+    /// has to carry on from where the last chunk ended.
     fn readings() -> AgentDb {
         let db = AgentDb::open_in_memory().unwrap();
         db.define_table(&TableDef::new("readings").optional("level", FieldType::Text))
@@ -695,6 +695,37 @@ mod tests {
             db.batch(batch.to_vec()).unwrap();
         }
         db
+    }
+
+    fn all_readings(db: &AgentDb) -> Vec<Doc> {
+        (0..3)
+            .flat_map(|page| {
+                let query = Query::table("readings").limit(500).offset(page * 500);
+                db.find(&query).unwrap().docs
+            })
+            .collect()
+    }
+
+    #[test]
+    fn renaming_and_removing_a_field_reach_every_document_of_a_large_table() {
+        let db = readings();
+        db.rename_field("readings", "level", "depth").unwrap();
+        let renamed = all_readings(&db);
+        assert_eq!(renamed.len(), 1201);
+        for doc in &renamed {
+            let expected = match doc.id {
+                7 => json!({}),
+                1100 => json!({"depth": "n/a"}),
+                1150 => json!({"depth": "?"}),
+                id => json!({"depth": id.to_string()}),
+            };
+            assert_eq!(json!(doc.fields), expected);
+        }
+
+        db.remove_field("readings", "depth", true).unwrap();
+        let emptied = all_readings(&db);
+        assert_eq!(emptied.len(), 1201);
+        assert!(emptied.iter().all(|doc| doc.fields.is_empty()));
     }
 
     #[test]
