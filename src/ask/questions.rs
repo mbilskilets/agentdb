@@ -532,7 +532,15 @@ mod tests {
 
     #[test]
     fn enum_values_that_look_like_other_options_stay_distinct() {
-        let values = ["started", "not started", "is started", NONE].map(str::to_owned);
+        let values = [
+            "started",
+            "not_started",
+            "not started",
+            "is started",
+            NONE,
+            "none",
+        ]
+        .map(str::to_owned);
         let mut names: Vec<String> = enum_options(&values).map(|(name, _, _)| name).collect();
         names.push(NONE.to_owned());
         let offered = names.len();
