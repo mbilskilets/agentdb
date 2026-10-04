@@ -169,6 +169,56 @@ mod tests {
     }
 
     #[test]
+    fn enum_values_must_be_distinct_and_not_empty() {
+        let db = crm();
+        let stage = |values: &[&str]| {
+            TableDef::new("deals").required(
+                "stage",
+                FieldType::Enum {
+                    values: values.iter().map(|&value| value.to_owned()).collect(),
+                },
+            )
+        };
+        assert_eq!(
+            message(db.define_table(&stage(&["open", "won", "open"]))),
+            "enum field `stage` lists `open` more than once. List every allowed value exactly once."
+        );
+        assert_eq!(
+            message(db.define_table(&stage(&["open", ""]))),
+            "enum field `stage` cannot allow an empty value. Give every allowed value at least one character; leave the field unset to mean \"no value\"."
+        );
+        assert!(matches!(
+            db.add_enum_value("clients", "status", ""),
+            Err(DbError::BlankEnumValue { .. })
+        ));
+        assert!(matches!(
+            db.change_field_type(
+                "clients",
+                "name",
+                FieldType::Enum {
+                    values: vec!["Acme".to_owned(), "Acme".to_owned()],
+                },
+            ),
+            Err(DbError::RepeatedEnumValue { .. })
+        ));
+        db.define_table(&stage(&["open", "won"])).unwrap();
+    }
+
+    #[test]
+    fn renaming_a_table_renames_it_in_the_change_log() {
+        let db = crm();
+        db.rename_table("clients", "customers").unwrap();
+        let tables: Vec<String> = db
+            .changes_since(0)
+            .unwrap()
+            .into_iter()
+            .filter(|change| change.kind == ChangeKind::Insert)
+            .map(|change| change.table)
+            .collect();
+        assert_eq!(tables, ["companies", "customers", "customers"]);
+    }
+
+    #[test]
     fn schema_changes_reach_subscribers_and_failed_ones_do_not() {
         let db = crm();
         let live = db.subscribe().unwrap();

@@ -251,6 +251,48 @@ mod tests {
     }
 
     #[test]
+    fn ne_also_matches_documents_where_the_field_is_unset() {
+        let db = crm();
+        db.insert("clients", json!({"name": "Acme", "email": "a@acme.io"}))
+            .unwrap();
+        db.insert("clients", json!({"name": "Globex", "email": "g@globex.io"}))
+            .unwrap();
+        db.insert("clients", json!({"name": "Initech"})).unwrap();
+        assert_eq!(
+            names(
+                &db,
+                &Query::table("clients").filter("email", Op::Ne, "a@acme.io")
+            ),
+            ["Globex", "Initech"]
+        );
+        assert_eq!(
+            names(
+                &db,
+                &Query::table("clients").filter("email", Op::Ne, json!(null))
+            ),
+            ["Acme", "Globex"]
+        );
+    }
+
+    #[test]
+    fn contains_ignores_case_in_any_language() {
+        let db = crm();
+        for name in ["Łódź Fabryczna", "ŻABKA Polska", "Zabka"] {
+            db.insert("clients", json!({"name": name})).unwrap();
+        }
+        let containing = |text: &str| {
+            names(
+                &db,
+                &Query::table("clients").filter("name", Op::Contains, text),
+            )
+        };
+        assert_eq!(containing("łódź"), ["Łódź Fabryczna"]);
+        assert_eq!(containing("ŁÓDŹ"), ["Łódź Fabryczna"]);
+        assert_eq!(containing("żabka"), ["ŻABKA Polska"]);
+        assert_eq!(containing("abka"), ["ŻABKA Polska", "Zabka"]);
+    }
+
+    #[test]
     fn datetimes_are_stored_in_utc() {
         let db = crm();
         seed(&db);

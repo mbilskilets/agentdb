@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 
 use crate::change::{Change, ChangeKind};
 use crate::error::{DbError, Result};
-use crate::query::Query;
+use crate::query::{Query, register_functions};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -126,6 +126,7 @@ impl AgentDb {
         }
         conn.execute_batch(SETUP)?;
         conn.pragma_update(None, "user_version", FORMAT_VERSION)?;
+        register_functions(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             subscribers: Mutex::new(Vec::new()),

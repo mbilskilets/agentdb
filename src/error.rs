@@ -95,6 +95,16 @@ pub enum DbError {
     #[error("enum field `{field}` needs at least one allowed value.")]
     EmptyEnum { field: String },
 
+    #[error(
+        "enum field `{field}` lists `{value}` more than once. List every allowed value exactly once."
+    )]
+    RepeatedEnumValue { field: String, value: String },
+
+    #[error(
+        "enum field `{field}` cannot allow an empty value. Give every allowed value at least one character; leave the field unset to mean \"no value\"."
+    )]
+    BlankEnumValue { field: String },
+
     #[error("operator `{op}` does not work on field `{field}` ({field_type}). Operators for this field: {}.", list(.allowed))]
     InvalidOperator {
         field: String,
@@ -225,6 +235,8 @@ impl DbError {
             Self::RequiredFieldOnExistingDocs { .. } => "required_field_on_existing_docs",
             Self::InvalidName { .. } => "invalid_name",
             Self::EmptyEnum { .. } => "empty_enum",
+            Self::RepeatedEnumValue { .. } => "repeated_enum_value",
+            Self::BlankEnumValue { .. } => "blank_enum_value",
             Self::InvalidOperator { .. } => "invalid_operator",
             Self::WouldDestroy { .. } => "would_destroy",
             Self::TableReferenced { .. } => "table_referenced",

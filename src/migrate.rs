@@ -13,7 +13,7 @@ use crate::db::{
     to_json,
 };
 use crate::error::{DbError, Result};
-use crate::schema::{Field, FieldType, TableDef, check_name, validate_field};
+use crate::schema::{Field, FieldType, TableDef, check_enum_value, check_name, validate_field};
 
 /// One change to the schema. Pass several to [`AgentDb::migrate`] to apply
 /// them as a unit.
@@ -349,10 +349,12 @@ fn rename_table(conn: &Connection, table: &str, new_name: &str) -> Result<()> {
         "UPDATE _tables SET name = ?2, schema = ?3 WHERE name = ?1",
         params![table, new_name, to_json(&def)?],
     )?;
-    conn.execute(
-        "UPDATE docs SET tbl = ?2 WHERE tbl = ?1",
-        params![table, new_name],
-    )?;
+    for renamed in ["docs", "changes"] {
+        conn.execute(
+            &format!("UPDATE {renamed} SET tbl = ?2 WHERE tbl = ?1"),
+            params![table, new_name],
+        )?;
+    }
     for mut other in all_defs(conn)? {
         if retarget(&mut other, table, new_name) {
             save_def(conn, &other)?;
@@ -480,6 +482,7 @@ fn enum_values<'a>(def: &'a mut TableDef, table: &str, field: &str) -> Result<&'
 fn add_enum_value(conn: &Connection, table: &str, field: &str, value: &str) -> Result<()> {
     let mut def = load_def(conn, table)?;
     let values = enum_values(&mut def, table, field)?;
+    check_enum_value(field, value)?;
     if values.iter().any(|existing| existing == value) {
         return Err(DbError::EnumValueExists {
             table: table.to_owned(),

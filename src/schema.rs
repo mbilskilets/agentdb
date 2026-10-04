@@ -227,11 +227,36 @@ pub(crate) fn validate_field(field: &Field) -> Result<()> {
         });
     }
     match &field.kind {
-        FieldType::Enum { values } if values.is_empty() => Err(DbError::EmptyEnum {
-            field: field.name.clone(),
-        }),
+        FieldType::Enum { values } => check_enum_values(&field.name, values),
         _ => Ok(()),
     }
+}
+
+fn check_enum_values(field: &str, values: &[String]) -> Result<()> {
+    if values.is_empty() {
+        return Err(DbError::EmptyEnum {
+            field: field.to_owned(),
+        });
+    }
+    for (index, value) in values.iter().enumerate() {
+        check_enum_value(field, value)?;
+        if values.iter().take(index).any(|earlier| earlier == value) {
+            return Err(DbError::RepeatedEnumValue {
+                field: field.to_owned(),
+                value: value.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_enum_value(field: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(DbError::BlankEnumValue {
+            field: field.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn check_name(name: &str) -> Result<()> {

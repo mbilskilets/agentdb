@@ -1,3 +1,5 @@
+use rusqlite::Connection;
+use rusqlite::functions::FunctionFlags;
 use rusqlite::types::Value as SqlValue;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -7,6 +9,7 @@ use crate::schema::{FieldType, TableDef};
 
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 500;
+const LOWERCASE: &str = "agentdb_lowercase";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -17,7 +20,8 @@ pub enum Op {
     Gte,
     Lt,
     Lte,
-    /// Case-insensitive substring match on a text field.
+    /// Substring match on a text field that ignores letter case in any
+    /// language.
     Contains,
 }
 
@@ -37,7 +41,7 @@ impl Op {
     const fn sql(self) -> &'static str {
         match self {
             Self::Eq => "=",
-            Self::Ne => "<>",
+            Self::Ne => "IS NOT",
             Self::Gt => ">",
             Self::Gte => ">=",
             Self::Lt => "<",
@@ -207,12 +211,31 @@ fn compile_filter(def: &TableDef, filter: &Filter) -> Result<(String, Option<Sql
         };
     }
     let value = kind.coerce(&def.name, &filter.field, &filter.value)?;
-    let clause = if filter.op == Op::Contains {
-        format!("instr(lower({column}), lower(?)) > 0")
-    } else {
-        format!("{column} {} ?", filter.op.sql())
-    };
-    Ok((clause, Some(sql_value(&value)?)))
+    if let (Op::Contains, Value::String(needle)) = (filter.op, &value) {
+        return Ok((
+            format!("instr({LOWERCASE}({column}), ?) > 0"),
+            Some(SqlValue::Text(needle.to_lowercase())),
+        ));
+    }
+    Ok((
+        format!("{column} {} ?", filter.op.sql()),
+        Some(sql_value(&value)?),
+    ))
+}
+
+/// Registers the SQL function `contains` relies on. SQLite's own `lower()`
+/// only knows ASCII, so it would miss `Łódź` when asked for `łódź`.
+pub(crate) fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
+    conn.create_scalar_function(
+        LOWERCASE,
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |call| {
+            Ok(call
+                .get::<Option<String>>(0)?
+                .map(|text| text.to_lowercase()))
+        },
+    )
 }
 
 fn sql_value(value: &Value) -> Result<SqlValue> {
