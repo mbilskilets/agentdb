@@ -1,8 +1,9 @@
-import { AgentDBError } from "./errors.js";
+import { AgentDBError, errorFrom } from "./errors.js";
 import { buildTools, type ToolOptions } from "./tools.js";
 import type {
   Asked,
   Change,
+  Changes,
   Doc,
   Fields,
   Page,
@@ -10,6 +11,7 @@ import type {
   Query,
   SchemaChange,
   TableInfo,
+  Write,
 } from "./types.js";
 
 export interface AgentDBOptions {
@@ -24,8 +26,15 @@ export interface AgentDBOptions {
 export interface SubscribeOptions {
   /** Replay every change after this `seq` before going live. Omit to get only new changes. */
   since?: number;
-  /** Called when the connection drops. The subscription reconnects by itself. */
+  /** Called when the connection drops. The subscription reconnects by itself and resumes where it left off. */
   onError?: (error: unknown) => void;
+  /**
+   * Called when changes were lost for good: the server keeps the newest
+   * 10,000 changes, and the subscription fell further behind than that.
+   * Read the current state again. `onChange` carries on with the writes
+   * made after this call.
+   */
+  onGap?: () => void;
 }
 
 const FIRST_RETRY_MS = 500;
@@ -45,7 +54,7 @@ export class AgentDB {
     this.fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
   }
 
-  /** One tenant's database. Its encrypted file is created on first use. */
+  /** One tenant's database. The server creates its encrypted file with the tenant's first schema change. */
   tenant(id: string): Tenant {
     return new Tenant(this, id);
   }
@@ -91,8 +100,24 @@ export class Tenant {
     return this.#request("PATCH", this.#docs(table, id), { patch, version: options.version });
   }
 
-  async delete(table: string, id: number): Promise<void> {
-    await this.#request("DELETE", this.#docs(table, id));
+  /**
+   * Pass the `version` you last read to refuse the delete if someone else
+   * changed the document in between.
+   */
+  async delete(table: string, id: number, options: { version?: number } = {}): Promise<void> {
+    const path = this.#docs(table, id);
+    await this.#request("DELETE", options.version === undefined ? path : `${path}?version=${options.version}`);
+  }
+
+  /**
+   * Applies up to 500 writes in order as one unit: if any fails, none takes
+   * effect and the error names the write. Returns one document per write:
+   * the document after the write, or its last state for a delete. Far
+   * faster than one call per document.
+   */
+  async batch<T = Fields>(writes: Write[]): Promise<Doc<T>[]> {
+    const body = await this.#request<{ docs: Doc<T>[] }>("POST", "/batch", { writes });
+    return body.docs;
   }
 
   async find<T = Fields>(query: Query): Promise<Page<T>> {
@@ -108,15 +133,20 @@ export class Tenant {
     return this.#request("POST", "/ask", { text });
   }
 
-  /** Up to 500 changes with a `seq` greater than `since`, oldest first. */
-  async changes(since = 0): Promise<Change[]> {
-    const body = await this.#request<{ changes: Change[] }>("GET", `/changes?since=${since}`);
-    return body.changes;
+  /**
+   * Up to 500 changes with a `seq` greater than `since`, oldest first, and
+   * the `seq` of the newest write. Without `since` it returns no changes,
+   * only where the log stands. The server keeps the newest 10,000 changes:
+   * asking for older ones fails with `changes_trimmed`.
+   */
+  async changes(since?: number): Promise<Changes> {
+    return this.#request("GET", since === undefined ? "/changes" : `/changes?since=${since}`);
   }
 
   /**
    * Calls `onChange` for every write, in order, until the returned function
-   * is called. Reconnects by itself and resumes where it left off.
+   * is called. Reconnects by itself and resumes where it left off. Pass
+   * `onGap` if you keep a copy of the data: it says when to read it again.
    */
   subscribe(onChange: (change: Change) => void, options: SubscribeOptions = {}): () => void {
     const abort = new AbortController();
@@ -157,14 +187,7 @@ export class Tenant {
       throw new AgentDBError("unreachable", `could not reach agentdb at ${this.#db.url}: ${reason}. Is the server running?`, 0);
     }
     if (response.ok) return response;
-    const text = await response.text();
-    let error: { code?: string; message?: string } = {};
-    try {
-      error = JSON.parse(text).error ?? {};
-    } catch {
-      // Not a JSON error body: fall through to the raw text.
-    }
-    throw new AgentDBError(error.code ?? "http_error", error.message ?? `agentdb answered ${response.status}: ${text}`, response.status);
+    throw errorFrom(await response.text(), response.status);
   }
 
   async #request<R>(method: string, path: string, body?: unknown): Promise<R> {
@@ -174,21 +197,31 @@ export class Tenant {
 
   async #stream(onChange: (change: Change) => void, options: SubscribeOptions, signal: AbortSignal): Promise<void> {
     let last = options.since;
+    let missedChanges = false;
     let retry = FIRST_RETRY_MS;
     while (!signal.aborted) {
       try {
-        // Without a starting point, start from the newest change that exists now.
-        last ??= await this.#latestSeq();
+        if (last === undefined) {
+          last = (await this.changes()).latest_seq;
+          if (signal.aborted) return;
+          if (missedChanges) options.onGap?.();
+          missedChanges = false;
+        }
         const response = await this.#open("GET", `/subscribe?since=${last}`, undefined, signal);
         retry = FIRST_RETRY_MS;
-        for await (const data of serverSentEvents(response)) {
-          const change = JSON.parse(data) as Change;
-          if (change.seq <= last) continue;
+        for await (const event of serverSentEvents(response)) {
+          if (event.name === "error") throw errorFrom(event.data, 0);
+          const change: Change = JSON.parse(event.data);
           last = change.seq;
           onChange(change);
         }
       } catch (error) {
         if (signal.aborted) return;
+        if (error instanceof AgentDBError && error.code === "changes_trimmed") {
+          last = undefined;
+          missedChanges = true;
+          continue;
+        }
         options.onError?.(error);
       }
       if (signal.aborted) return;
@@ -196,36 +229,26 @@ export class Tenant {
       retry = Math.min(retry * 2, MAX_RETRY_MS);
     }
   }
-
-  /** The `seq` of the newest change, or 0 for an empty database. */
-  async #latestSeq(): Promise<number> {
-    let last = 0;
-    for (;;) {
-      const page = await this.changes(last);
-      const newest = page.at(-1);
-      if (!newest) return last;
-      last = newest.seq;
-    }
-  }
 }
 
-/** Yields the `data` of each server-sent event in the response body. */
-async function* serverSentEvents(response: Response): AsyncGenerator<string> {
+/** Yields the name and data of each server-sent event in the response body. An event without a name is a `message`. */
+async function* serverSentEvents(response: Response): AsyncGenerator<{ name: string; data: string }> {
   if (!response.body) return;
   const decoder = new TextDecoder();
   let buffer = "";
-  for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+  for await (const chunk of response.body) {
     buffer += decoder.decode(chunk, { stream: true });
     let end = buffer.indexOf("\n\n");
     while (end !== -1) {
-      const event = buffer.slice(0, end);
+      const lines = buffer.slice(0, end).split("\n");
       buffer = buffer.slice(end + 2);
-      const data = event
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart())
-        .join("\n");
-      if (data) yield data;
+      const field = (name: string) =>
+        lines
+          .filter((line) => line.startsWith(`${name}:`))
+          .map((line) => line.slice(name.length + 1).trimStart())
+          .join("\n");
+      const data = field("data");
+      if (data) yield { name: field("event") || "message", data };
       end = buffer.indexOf("\n\n");
     }
   }

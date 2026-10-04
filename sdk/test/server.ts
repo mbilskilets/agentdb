@@ -4,7 +4,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-export const SECRET = "sdk test secret";
+export const SECRET = "sdk test secret, long enough to start";
 const ROOT = join(import.meta.dirname, "..", "..");
 const BINARY = join(ROOT, "target", "debug", "agentdb-server");
 
@@ -38,7 +38,7 @@ export async function startServer(): Promise<{ url: string; stop: () => void }> 
     env: {
       PATH: process.env.PATH,
       AGENTDB_SECRET: SECRET,
-      AGENTDB_MASTER_KEY: "sdk test master key",
+      AGENTDB_MASTER_KEY: "sdk test master key, long enough to start",
       AGENTDB_DATA_DIR: mkdtempSync(join(tmpdir(), "agentdb-sdk-")),
       AGENTDB_PORT: String(port),
       ...(key ? { TYPESAFE_API_KEY: key } : {}),

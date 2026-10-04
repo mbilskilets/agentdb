@@ -12,6 +12,13 @@ export type FieldType =
 export type Field = FieldType & {
   name: string;
   required: boolean;
+  /**
+   * Lets a table of any size be filtered and sorted by this field, at the
+   * price of slightly slower writes. Always true for a unique field and a ref.
+   */
+  indexed?: boolean;
+  /** No two documents may hold the same value. Documents that leave the field unset do not clash. */
+  unique?: boolean;
   /** What the field means, in plain words. */
   description?: string;
 };
@@ -58,7 +65,13 @@ export interface Filter {
   value: string | number | boolean | null;
 }
 
-/** A read of one table. All filters must match. */
+/**
+ * A read of one table. All filters must match. A table with more than 1,000
+ * documents is only searched through an index: the query is refused with
+ * `query_needs_index` unless it filters an indexed field with `eq`, `gt`,
+ * `gte`, `lt` or `lte`, or has no filter and sorts by an indexed field.
+ * `id`, `created_at` and `updated_at` are always indexed.
+ */
 export interface Query {
   table: string;
   where?: Filter[];
@@ -101,6 +114,22 @@ export interface Change<T = Fields> {
   doc: Doc<T> | null;
 }
 
+/** A page of the change log, as `changes()` returns it. */
+export interface Changes {
+  /** Up to 500 changes, oldest first. Empty when no `since` was given. */
+  changes: Change[];
+  /** The `seq` of the newest write. There is more to fetch while the last change here is older. */
+  latest_seq: number;
+}
+
+/** One write to a document. Several passed to `batch` apply as a unit. */
+export type Write =
+  | { op: "insert"; table: string; doc: Fields }
+  /** `null` in `patch` removes an optional field. With `version`, refused unless the document is still at that version. */
+  | { op: "update"; table: string; id: number; patch: Patch; version?: number }
+  /** With `version`, refused unless the document is still at that version. */
+  | { op: "delete"; table: string; id: number; version?: number };
+
 /** One change to the schema. Several passed to `migrate` apply as a unit. */
 export type SchemaChange =
   | { op: "define_table"; table: TableDef }
@@ -109,6 +138,10 @@ export type SchemaChange =
   | { op: "rename_field"; table: string; field: string; new_name: string }
   | { op: "change_type"; table: string; field: string; to: FieldType }
   | { op: "set_required"; table: string; field: string; required: boolean }
+  /** A table has at most 10 indexed fields. A unique field and a ref stay indexed. */
+  | { op: "set_indexed"; table: string; field: string; indexed: boolean }
+  /** Refuses while two documents hold the same value. */
+  | { op: "set_unique"; table: string; field: string; unique: boolean }
   | { op: "add_enum_value"; table: string; field: string; value: string }
   | { op: "remove_enum_value"; table: string; field: string; value: string }
   | { op: "describe"; table: string; field?: string; description: string }

@@ -509,6 +509,17 @@ mod tests {
 
         insert_clients(&base, "acme", 10_000).await;
         let (status, body) = call("GET", of(&base, "acme/changes"), SECRET, Value::Null).await;
+        assert_eq!(
+            (status, body),
+            (200, json!({"changes": [], "latest_seq": 10_003}))
+        );
+        let (status, body) = call(
+            "GET",
+            of(&base, "acme/changes?since=0"),
+            SECRET,
+            Value::Null,
+        )
+        .await;
         assert_eq!((status, code(&body)), (410, "changes_trimmed"));
         assert!(
             message(&body).ends_with("continue from seq 10003."),

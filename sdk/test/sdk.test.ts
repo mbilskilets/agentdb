@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
-import { AgentDB, AgentDBError, type Change, type Tenant } from "../src/index.js";
+import { AgentDB, AgentDBError, type Change, type Query, type Tenant, type Write } from "../src/index.js";
 import { SECRET, startServer, typesafeKey } from "./server.js";
 
 interface Client {
@@ -42,6 +42,12 @@ async function crm(): Promise<Tenant> {
   return db;
 }
 
+/** Adds `count` clients, named `Client 0` and up, with their number as revenue. */
+async function insertClients(db: Tenant, count: number): Promise<void> {
+  const writes: Write[] = Array.from({ length: count }, (_, n) => ({ op: "insert", table: "clients", doc: { name: `Client ${n}`, revenue: n } }));
+  for (let first = 0; first < count; first += 500) await db.batch(writes.slice(first, first + 500));
+}
+
 async function failure(work: Promise<unknown>): Promise<AgentDBError> {
   const error = await work.then(
     () => undefined,
@@ -78,6 +84,42 @@ describe("documents", () => {
     expect((await failure(db.get("clients", acme.id))).code).toBe("not_found");
   });
 
+  test("a delete with a stale version is refused", async () => {
+    const db = await crm();
+    const acme = await db.insert<Client>("clients", { name: "Acme" });
+    await db.update<Client>("clients", acme.id, { revenue: 1 });
+    const stale = await failure(db.delete("clients", acme.id, { version: acme.version }));
+    expect([stale.code, stale.status]).toEqual(["version_conflict", 409]);
+    await db.delete("clients", acme.id, { version: 2 });
+    expect((await db.find({ table: "clients" })).total).toBe(0);
+  });
+
+  test("a batch applies every write or none", async () => {
+    const db = await crm();
+    const docs = await db.batch<Client>([
+      { op: "insert", table: "clients", doc: { name: "Acme" } },
+      { op: "insert", table: "clients", doc: { name: "Globex" } },
+      { op: "update", table: "clients", id: 1, patch: { revenue: 5 }, version: 1 },
+      { op: "delete", table: "clients", id: 2 },
+    ]);
+    expect(docs.map((doc) => [doc.id, doc.version, doc.name, doc.revenue])).toEqual([
+      [1, 1, "Acme", undefined],
+      [2, 1, "Globex", undefined],
+      [1, 2, "Acme", 5],
+      [2, 1, "Globex", undefined],
+    ]);
+
+    const error = await failure(
+      db.batch([
+        { op: "insert", table: "clients", doc: { name: "Initech" } },
+        { op: "insert", table: "clients", doc: { name: "Hooli", emial: "x" } },
+      ]),
+    );
+    expect(error.code).toBe("unknown_field");
+    expect(error.message).toMatch(/^step 2 of 2 failed, so none of the 2 changes were applied/);
+    expect((await db.find({ table: "clients" })).total).toBe(1);
+  });
+
   test("describe reports tables, fields and counts", async () => {
     const db = await crm();
     await db.insert("clients", { name: "Acme" });
@@ -90,6 +132,30 @@ describe("documents", () => {
     const db = await crm();
     await db.insert("clients", { name: "Acme" });
     expect(await agentdb.tenant(`empty_${++counter}`).describe()).toEqual([]);
+  });
+});
+
+describe("indexes", () => {
+  test("a unique field refuses a second document with the same value", async () => {
+    const db = await crm();
+    const [clients] = await db.migrate([{ op: "set_unique", table: "clients", field: "email", unique: true }]);
+    expect(clients?.fields[1]).toEqual({ name: "email", type: "text", required: false, indexed: true, unique: true });
+    await db.insert("clients", { name: "Acme", email: "hello@acme.io" });
+    const duplicate = await failure(db.insert("clients", { name: "Acme again", email: "hello@acme.io" }));
+    expect([duplicate.code, duplicate.status]).toEqual(["duplicate_value", 409]);
+  });
+
+  test("a table over 1,000 documents is only searched through an index", async () => {
+    const db = await crm();
+    await insertClients(db, 1001);
+    const byRevenue: Query = { table: "clients", where: [{ field: "revenue", op: "gte", value: 1000 }] };
+    const refused = await failure(db.find(byRevenue));
+    expect(refused.code).toBe("query_needs_index");
+    expect(refused.message).toContain('{"op": "set_indexed", "table": "clients", "field": "revenue", "indexed": true}');
+
+    const [clients] = await db.migrate([{ op: "set_indexed", table: "clients", field: "revenue", indexed: true }]);
+    expect(clients?.fields[3]).toEqual({ name: "revenue", type: "number", required: false, indexed: true });
+    expect((await db.find<Client>(byRevenue)).docs.map((doc) => doc.name)).toEqual(["Client 1000"]);
   });
 });
 
@@ -160,7 +226,63 @@ describe("subscribe", () => {
     await until(() => seen.length === 2);
     stopWatching();
     expect(seen.map((change) => change.kind)).toEqual(["schema", "insert"]);
-    expect(await db.changes(1)).toEqual([seen[1]]);
+    expect(await db.changes(1)).toEqual({ changes: [seen[1]], latest_seq: 2 });
+    expect(await db.changes()).toEqual({ changes: [], latest_seq: 2 });
+  });
+
+  test("a subscriber further behind than the log reaches is told, then carries on", async () => {
+    const db = await crm();
+    await insertClients(db, 10_000);
+    const events: string[] = [];
+    const stopWatching = db.subscribe((change) => events.push(`change ${change.seq}`), {
+      since: 0,
+      onGap: () => events.push("gap"),
+      onError: (error) => events.push(`error ${String(error)}`),
+    });
+    await until(() => events.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await db.insert("clients", { name: "Acme" });
+    await until(() => events.length === 2);
+    stopWatching();
+    expect(events).toEqual(["gap", "change 10002"]);
+  });
+
+  test("subscribing to a long change log starts with the next write", async () => {
+    const db = await crm();
+    await insertClients(db, 10_000);
+    const events: string[] = [];
+    const stopWatching = db.subscribe((change) => events.push(`change ${change.seq}`), {
+      onGap: () => events.push("gap"),
+      onError: (error) => events.push(`error ${String(error)}`),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await db.insert("clients", { name: "Acme" });
+    await until(() => events.length === 1);
+    stopWatching();
+    expect(events).toEqual(["change 10002"]);
+  });
+
+  test("a feed the server ends for falling behind is a gap too", async () => {
+    const insert = (seq: number) => `id: ${seq}\ndata: ${JSON.stringify({ seq, table: "clients", kind: "insert", at: "2026-10-04T00:00:00Z", doc: null })}\n\n`;
+    const trimmed = `event: error\ndata: ${JSON.stringify({ error: { code: "changes_trimmed", message: "cannot replay changes after seq 3" } })}\n\n`;
+    const feeds = [insert(3) + trimmed, insert(9)];
+    const requests: string[] = [];
+    const server: typeof fetch = async (url) => {
+      const path = String(url).replace("http://agentdb.test/v1/tenants/acme", "");
+      requests.push(path);
+      return path === "/changes" ? Response.json({ changes: [], latest_seq: 8 }) : new Response(feeds.shift() ?? "");
+    };
+    const db = new AgentDB({ url: "http://agentdb.test", secret: SECRET, fetch: server }).tenant("acme");
+    const events: string[] = [];
+    const stopWatching = db.subscribe((change) => events.push(`change ${change.seq}`), {
+      since: 2,
+      onGap: () => events.push("gap"),
+      onError: (error) => events.push(`error ${String(error)}`),
+    });
+    await until(() => events.length === 3);
+    stopWatching();
+    expect(events).toEqual(["change 3", "gap", "change 9"]);
+    expect(requests.slice(0, 3)).toEqual(["/subscribe?since=2", "/changes", "/subscribe?since=8"]);
   });
 });
 
@@ -171,7 +293,7 @@ describe("tools", () => {
   test("input schemas list the tenant's exact fields and allowed values", async () => {
     const db = await crm();
     const tools = await db.tools();
-    expect(Object.keys(tools).sort()).toEqual(["ask_database", "change_schema", "delete_document", "describe_database", "find_documents", "get_document", "insert_document", "update_document"]);
+    expect(Object.keys(tools).sort()).toEqual(["ask_database", "change_schema", "delete_document", "describe_database", "find_documents", "get_document", "insert_document", "update_document", "write_documents"]);
     const insert = JSON.parse(await schemaOf(tools.insert_document));
     const clients = insert.properties.document.anyOf[0];
     expect(clients.title).toBe("clients");
@@ -181,7 +303,82 @@ describe("tools", () => {
     expect(tools.find_documents?.description).toContain("- clients (Businesses we sell to): name: text, email?: text, status?: lead|active, revenue?: number");
 
     const readOnly = await db.tools({ schemaChanges: false, deletes: false, ask: false });
-    expect(Object.keys(readOnly).sort()).toEqual(["describe_database", "find_documents", "get_document", "insert_document", "update_document"]);
+    expect(Object.keys(readOnly).sort()).toEqual(["describe_database", "find_documents", "get_document", "insert_document", "update_document", "write_documents"]);
+  });
+
+  test("the model is told which fields are indexed and what large tables need", async () => {
+    const db = await crm();
+    await db.migrate([
+      { op: "set_unique", table: "clients", field: "email", unique: true },
+      { op: "set_indexed", table: "clients", field: "status", indexed: true },
+    ]);
+    const find = (await db.tools()).find_documents?.description;
+    expect(find).toContain("- clients (Businesses we sell to): name: text, email?: text (unique), status?: lead|active (indexed), revenue?: number");
+    expect(find).toContain("A table with more than 1,000 documents is searched only through an index");
+    expect(find).toContain('index it first with change_schema: {"op": "set_indexed"');
+    const withoutSchemaChanges = (await db.tools({ schemaChanges: false })).find_documents?.description;
+    expect(withoutSchemaChanges).toContain("A table with more than 1,000 documents is searched only through an index");
+    expect(withoutSchemaChanges).not.toContain("change_schema");
+  });
+
+  test("the agent can index a field, make one unique and delete with a version", async () => {
+    const db = await crm();
+    const tools = await db.tools();
+    const schema = await call(tools.change_schema, {
+      changes: [
+        { op: "set_indexed", table: "clients", field: "revenue", indexed: true },
+        { op: "set_unique", table: "clients", field: "email", unique: true },
+        { op: "add_field", table: "clients", field: { name: "phone", type: "text", required: false, indexed: true } },
+      ],
+    });
+    expect(schema[0].fields.filter((field: { indexed?: boolean }) => field.indexed).map((field: { name: string }) => field.name)).toEqual(["email", "revenue", "phone"]);
+
+    await call(tools.insert_document, { table: "clients", document: { name: "Acme" } });
+    await call(tools.update_document, { table: "clients", id: 1, patch: { revenue: 5 } });
+    const stale = await call(tools.delete_document, { table: "clients", id: 1, version: 1 });
+    expect(stale.code).toBe("version_conflict");
+    expect(await call(tools.delete_document, { table: "clients", id: 1, version: 2 })).toEqual({ deleted: true });
+  });
+
+  test("write_documents applies a batch as a unit and names the write that failed", async () => {
+    const db = await crm();
+    const tools = await db.tools();
+    const written = await call(tools.write_documents, {
+      writes: [
+        { op: "insert", table: "clients", doc: { name: "Acme" } },
+        { op: "insert", table: "clients", doc: { name: "Globex" } },
+        { op: "update", table: "clients", id: 1, patch: { status: "active" } },
+        { op: "delete", table: "clients", id: 2 },
+      ],
+    });
+    expect(written.map((doc: { id: number; version: number }) => [doc.id, doc.version])).toEqual([[1, 1], [2, 1], [1, 2], [2, 1]]);
+    const failed = await call(tools.write_documents, {
+      writes: [
+        { op: "insert", table: "clients", doc: { name: "Initech" } },
+        { op: "insert", table: "clients", doc: { name: "Hooli", stauts: "lead" } },
+      ],
+    });
+    expect(failed.code).toBe("unknown_field");
+    expect(failed.error).toMatch(/^step 2 of 2 failed, so none of the 2 changes were applied: unknown field `stauts`/);
+    expect((await db.find({ table: "clients" })).total).toBe(1);
+  });
+
+  test("a batch cannot delete when deletes are turned off", async () => {
+    const db = await crm();
+    await db.insert("clients", { name: "Acme" });
+    const tools = await db.tools({ deletes: false });
+    const ops = JSON.parse(await schemaOf(tools.write_documents)).properties.writes.items.anyOf.map((write: { properties: { op: { enum: string[] } } }) => write.properties.op.enum[0]);
+    expect(ops).toEqual(["insert", "update"]);
+    expect(tools.write_documents?.description).toContain("inserts and updates, in order");
+
+    const refused = await call(tools.write_documents, {
+      writes: [
+        { op: "insert", table: "clients", doc: { name: "Globex" } },
+        { op: "delete", table: "clients", id: 1 },
+      ],
+    });
+    expect(refused).toEqual({ code: "deletes_disabled", error: "this batch contains a delete, and you may not delete documents. Nothing was written. Send it again without the delete." });
+    expect((await db.find<Client>({ table: "clients" })).docs.map((doc) => doc.name)).toEqual(["Acme"]);
   });
 
   test("run against the database and hand errors back to the model", async () => {

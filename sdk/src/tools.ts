@@ -2,12 +2,12 @@ import type { ToolSet } from "ai";
 
 import type { Tenant } from "./client.js";
 import { AgentDBError } from "./errors.js";
-import type { Field, Fields, Filter, Query, SchemaChange, TableInfo } from "./types.js";
+import type { Field, Fields, Filter, Query, SchemaChange, TableInfo, Write } from "./types.js";
 
 export interface ToolOptions {
   /** Let the agent create and change tables. Default true. */
   schemaChanges?: boolean;
-  /** Let the agent delete documents. Default true. */
+  /** Let the agent delete documents, one at a time or in a batch. Default true. */
   deletes?: boolean;
   /** Include the English-query tool. Default true. */
   ask?: boolean;
@@ -83,12 +83,13 @@ function summary(tables: TableInfo[]): string {
   const lines = tables.map((table) => {
     const fields = table.fields.map((field) => {
       const kind = field.type === "enum" ? field.values.join("|") : field.type === "ref" ? `id of ${field.table}` : field.type;
-      return `${field.name}${field.required ? "" : "?"}: ${kind}`;
+      const mark = field.unique ? " (unique)" : field.indexed ? " (indexed)" : "";
+      return `${field.name}${field.required ? "" : "?"}: ${kind}${mark}`;
     });
     const note = table.description ? ` (${table.description})` : "";
     return `- ${table.name}${note}: ${fields.join(", ")}`;
   });
-  return `Tables (a trailing ? marks an optional field):\n${lines.join("\n")}\nEvery document also has id, version, created_at and updated_at, set by the database.`;
+  return `Tables (a trailing ? marks an optional field; no two documents may share the value of a unique field):\n${lines.join("\n")}\nEvery document also has id, version, created_at and updated_at, set by the database.`;
 }
 
 const FIELD_TYPE: JsonSchema = {
@@ -107,6 +108,8 @@ const FIELD: JsonSchema = {
     name: { type: "string", description: "lowercase letters, digits and underscores" },
     ...(FIELD_TYPE.properties as object),
     required: { type: "boolean" },
+    indexed: { type: "boolean", description: "set true for a field that a table of more than 1,000 documents is filtered or sorted by" },
+    unique: { type: "boolean", description: "set true when no two documents may hold the same value" },
     description: { type: "string" },
   },
   required: ["name", "type", "required"],
@@ -118,12 +121,13 @@ const SCHEMA_CHANGE: JsonSchema = {
     "One schema change. `op` decides which other properties are needed: " +
     "define_table {table: {name, description?, fields}}; add_field {table, field}; rename_table {table, new_name}; " +
     "rename_field {table, field, new_name}; change_type {table, field, to}; set_required {table, field, required}; " +
+    "set_indexed {table, field, indexed}; set_unique {table, field, unique}; " +
     "add_enum_value {table, field, value}; remove_enum_value {table, field, value}; describe {table, field?, description}; " +
     "remove_field {table, field, force?}; drop_table {table, force?}.",
   properties: {
     op: {
       type: "string",
-      enum: ["define_table", "add_field", "rename_table", "rename_field", "change_type", "set_required", "add_enum_value", "remove_enum_value", "describe", "remove_field", "drop_table"],
+      enum: ["define_table", "add_field", "rename_table", "rename_field", "change_type", "set_required", "set_indexed", "set_unique", "add_enum_value", "remove_enum_value", "describe", "remove_field", "drop_table"],
     },
     table: {
       description: "the table name; for define_table, the whole table definition",
@@ -140,12 +144,42 @@ const SCHEMA_CHANGE: JsonSchema = {
     new_name: { type: "string" },
     to: FIELD_TYPE,
     required: { type: "boolean" },
+    indexed: { type: "boolean", description: "a table has at most 10 indexed fields; unique fields and refs are always indexed" },
+    unique: { type: "boolean", description: "refused while two documents hold the same value" },
     value: { type: "string" },
     description: { type: "string" },
     force: { type: "boolean", description: "only after a refusal told you how much data would be deleted, and the user wants that" },
   },
   required: ["op", "table"],
 };
+
+/** What `find_documents` tells the model about tables too large to search without an index. */
+function indexRule(canChangeSchema: boolean): string {
+  const rule =
+    "A table with more than 1,000 documents is searched only through an index: at least one filter must compare an indexed field with eq, gt, gte, lt or lte, " +
+    "and a search without filters may sort only by an indexed field. Indexed are the fields marked (indexed) or (unique) below, and always id, created_at and updated_at. " +
+    "A search that breaks this rule fails with query_needs_index, and one that still has to read too much is stopped with query_too_slow.";
+  const fix = ' To search by another field, index it first with change_schema: {"op": "set_indexed", "table": "<table>", "field": "<field>", "indexed": true}.';
+  return canChangeSchema ? rule + fix : rule;
+}
+
+/** The shapes `write_documents` accepts for one write. Deletes are left out when the agent may not delete. */
+function writeSchema(tables: TableInfo[], tableName: JsonSchema, canDelete: boolean): JsonSchema {
+  const write = (op: string, properties: JsonSchema, required: string[]): JsonSchema => ({
+    type: "object",
+    properties: { op: { type: "string", enum: [op] }, table: tableName, ...properties },
+    required: ["op", "table", ...required],
+    additionalProperties: false,
+  });
+  const id = { type: "integer" };
+  const version = { type: "integer", description: "the version you last read; the write is refused if the document changed since" };
+  const shapes = [
+    write("insert", { doc: anyTable(tables, documentSchema) }, ["doc"]),
+    write("update", { id, patch: anyTable(tables, patchSchema), version }, ["id", "patch"]),
+  ];
+  if (canDelete) shapes.push(write("delete", { id, version }, ["id"]));
+  return { anyOf: shapes };
+}
 
 /** Runs a tool body and hands an agentdb error to the model as the result, so it can correct the call. */
 async function attempt<R>(work: () => Promise<R>): Promise<R | { error: string; code: string }> {
@@ -166,6 +200,8 @@ export async function buildTools(tenant: Tenant, options: ToolOptions = {}): Pro
   const tableName = { type: "string", description: `one of: ${names}` };
   const filterFields = [...new Set(tables.flatMap((table) => table.fields.map((field) => field.name))), ...SYSTEM_FIELDS];
   const object = (properties: JsonSchema, required: string[]): JsonSchema => ({ type: "object", properties, required, additionalProperties: false });
+  const canChangeSchema = options.schemaChanges ?? true;
+  const canDelete = options.deletes ?? true;
 
   const tools: ToolSet = {
     describe_database: tool({
@@ -179,7 +215,7 @@ export async function buildTools(tenant: Tenant, options: ToolOptions = {}): Pro
       execute: ({ table, id }) => attempt(() => tenant.get(table, id)),
     }),
     find_documents: tool({
-      description: `Search one table with exact filters. All filters must match. Returns the documents, the total number of matches, and next_offset when there are more.\n${summary(tables)}`,
+      description: `Search one table with exact filters. All filters must match. Returns the documents, the total number of matches, and next_offset when there are more.\n${indexRule(canChangeSchema)}\n${summary(tables)}`,
       inputSchema: jsonSchema<Query>(
         object(
           {
@@ -216,6 +252,19 @@ export async function buildTools(tenant: Tenant, options: ToolOptions = {}): Pro
       ),
       execute: ({ table, id, patch, version }) => attempt(() => tenant.update(table, id, patch, { version })),
     }),
+    write_documents: tool({
+      description:
+        `Apply up to 500 writes as one unit: ${canDelete ? "inserts, updates and deletes" : "inserts and updates"}, in order, across any tables. Either every write takes effect or none does, and a failure names the write that caused it. ` +
+        "Prefer this over one call per document whenever you write more than one: it is far faster, and it cannot leave the work half done. A later write sees the earlier ones. Returns one document per write, in order.",
+      inputSchema: jsonSchema<{ writes: Write[] }>(object({ writes: { type: "array", items: writeSchema(tables, tableName, canDelete), minItems: 1, maxItems: 500 } }, ["writes"])),
+      execute: ({ writes }) =>
+        attempt(async () => {
+          if (!canDelete && writes.some((write) => write.op === "delete")) {
+            throw new AgentDBError("deletes_disabled", "this batch contains a delete, and you may not delete documents. Nothing was written. Send it again without the delete.", 0);
+          }
+          return tenant.batch(writes);
+        }),
+    }),
   };
 
   if (options.ask ?? true) {
@@ -225,14 +274,14 @@ export async function buildTools(tenant: Tenant, options: ToolOptions = {}): Pro
       execute: ({ request }) => attempt(() => tenant.ask(request)),
     });
   }
-  if (options.deletes ?? true) {
+  if (canDelete) {
     tools.delete_document = tool({
-      description: "Permanently delete one document by its id. Refused while other documents link to it.",
-      inputSchema: jsonSchema<{ table: string; id: number }>(object({ table: tableName, id: { type: "integer" } }, ["table", "id"])),
-      execute: ({ table, id }) => attempt(async () => (await tenant.delete(table, id), { deleted: true })),
+      description: "Permanently delete one document by its id. Refused while other documents link to it. Pass the version you last read to refuse the delete if someone else changed the document in between.",
+      inputSchema: jsonSchema<{ table: string; id: number; version?: number }>(object({ table: tableName, id: { type: "integer" }, version: { type: "integer" } }, ["table", "id"])),
+      execute: ({ table, id, version }) => attempt(async () => (await tenant.delete(table, id, { version }), { deleted: true })),
     });
   }
-  if (options.schemaChanges ?? true) {
+  if (canChangeSchema) {
     tools.change_schema = tool({
       description: "Create tables or change their shape. The changes apply in order as one unit: if any fails, none take effect. Returns the new schema. A table you create here can be used right away with the other tools.",
       inputSchema: jsonSchema<{ changes: SchemaChange[] }>(object({ changes: { type: "array", items: SCHEMA_CHANGE, minItems: 1 } }, ["changes"])),

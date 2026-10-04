@@ -341,13 +341,19 @@ struct Changes {
     latest_seq: i64,
 }
 
+/// Up to 500 changes after `since`, and the `seq` of the newest write.
+/// Without `since` there is nothing to replay, and the answer says only
+/// where the log stands.
 async fn changes(
     State(app): State<Arc<App>>,
     Path(tenant): Path<String>,
     UrlQuery(Since { since }): UrlQuery<Since>,
 ) -> Api<Changes> {
     with_tenant(app, tenant, Missing::Skip, move |db, _| {
-        let changes = db.changes_since(since.unwrap_or(0))?;
+        let changes = match since {
+            Some(seq) => db.changes_since(seq)?,
+            None => Vec::new(),
+        };
         Ok(Changes {
             changes,
             latest_seq: db.latest_seq()?,
