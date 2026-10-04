@@ -70,7 +70,9 @@ pub(super) mod id {
 /// Says that no listed name, value or phrase fits. It ends in a full stop,
 /// which no name can contain and no phrase of the request can end with.
 pub(super) const NONE: &str = "none.";
-pub(super) const NO_PERIOD: &str = "none";
+/// Says that the request does not restrict by this, in a question whose
+/// other options are fixed words too.
+pub(super) const UNRESTRICTED: &str = "none";
 pub(super) const YES: &str = "yes";
 pub(super) const NO: &str = "no";
 pub(super) const BY_ID: &str = "by_id";
@@ -267,7 +269,7 @@ pub(super) fn general(defs: &[TableDef], found: &Candidates) -> Questions {
                 PERIODS
                     .iter()
                     .copied()
-                    .chain([(NO_PERIOD, "the request has no time condition")]),
+                    .chain([(UNRESTRICTED, "the request has no time condition")]),
             ),
         ),
         (
@@ -453,7 +455,10 @@ fn field_questions(table: &str, field: &Field, found: &Candidates) -> Questions 
                         NO,
                         format!("only {table} that are not `{name}`: non-{name}, not {name}"),
                     ),
-                    ("none", format!("the request does not mention `{name}`")),
+                    (
+                        UNRESTRICTED,
+                        format!("the request does not mention `{name}`"),
+                    ),
                 ],
             ),
         )]),
@@ -472,7 +477,7 @@ fn field_questions(table: &str, field: &Field, found: &Candidates) -> Questions 
                         ),
                     ),
                     (
-                        "none",
+                        UNRESTRICTED,
                         format!("no, the request does not talk about a `{name}` or about {target}"),
                     ),
                 ],

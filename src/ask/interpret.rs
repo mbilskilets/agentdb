@@ -12,8 +12,8 @@ use super::calendar::{
 };
 use super::candidates::Candidates;
 use super::questions::{
-    self, ASCENDING, BY_ID, BY_PROPERTY, IS_NOT, NO, NO_PERIOD, ROLE_LIMIT, ROLE_SPAN, UNSUPPORTED,
-    YES, id,
+    self, ASCENDING, BY_ID, BY_PROPERTY, IS_NOT, NO, ROLE_LIMIT, ROLE_SPAN, UNRESTRICTED,
+    UNSUPPORTED, YES, id,
 };
 use super::reader::Reader;
 
@@ -229,7 +229,7 @@ fn time_condition(
 ) -> Built<Option<TimeCondition>> {
     let Some(period) = reader
         .pick(id::PERIOD)
-        .filter(|period| *period != NO_PERIOD)
+        .filter(|period| *period != UNRESTRICTED)
     else {
         return Ok(None);
     };
