@@ -1,3 +1,5 @@
+use std::ops::Not;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use time::format_description::well_known::{Iso8601, Rfc3339};
@@ -7,6 +9,8 @@ use crate::error::{DbError, Result};
 
 pub(crate) const SYSTEM_FIELDS: [&str; 4] = ["id", "version", "created_at", "updated_at"];
 const MAX_NAME_LEN: usize = 64;
+/// Every index is one more structure each write to the table has to update.
+pub(crate) const MAX_INDEXED_FIELDS: usize = 10;
 const MIN_SIMILARITY: f64 = 0.6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +72,14 @@ pub struct Field {
     #[serde(flatten)]
     pub kind: FieldType,
     pub required: bool,
+    /// Whether queries can filter and sort by this field without reading
+    /// every document. Always true for a unique field and for a ref.
+    #[serde(default, skip_serializing_if = "Not::not")]
+    pub indexed: bool,
+    /// Whether no two documents of the table may hold the same value.
+    /// Documents that leave the field unset do not clash.
+    #[serde(default, skip_serializing_if = "Not::not")]
+    pub unique: bool,
     /// What the field means, in plain words. Shown by `describe()` and used
     /// to understand English requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +92,8 @@ impl Field {
             name: name.into(),
             kind,
             required,
+            indexed: false,
+            unique: false,
             description: None,
         }
     }
@@ -88,6 +102,33 @@ impl Field {
     pub fn described(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
+    }
+
+    #[must_use]
+    pub const fn indexed(mut self) -> Self {
+        self.indexed = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn unique(mut self) -> Self {
+        self.unique = true;
+        self
+    }
+
+    pub(crate) fn links_to(&self, table: &str) -> bool {
+        matches!(&self.kind, FieldType::Ref { table: target } if target == table)
+    }
+
+    /// Why this field has an index whether or not one was asked for.
+    pub(crate) const fn index_reason(&self) -> Option<&'static str> {
+        if self.unique {
+            Some("it is unique; turn that off first with the set_unique schema change")
+        } else if matches!(self.kind, FieldType::Ref { .. }) {
+            Some("it is a ref, and deleting a document looks up what points to it")
+        } else {
+            None
+        }
     }
 }
 
@@ -144,6 +185,35 @@ impl TableDef {
             }
         }
         Ok(())
+    }
+
+    /// Marks the fields that always have an index as indexed, and refuses
+    /// a table with more indexed fields than [`MAX_INDEXED_FIELDS`].
+    pub(crate) fn settle_indexes(&mut self) -> Result<()> {
+        self.index_unique_and_ref_fields();
+        let indexed = self.indexed_fields();
+        if indexed.len() > MAX_INDEXED_FIELDS {
+            return Err(DbError::TooManyIndexes {
+                table: self.name.clone(),
+                max: MAX_INDEXED_FIELDS,
+                indexed,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn index_unique_and_ref_fields(&mut self) {
+        for field in &mut self.fields {
+            field.indexed |= field.index_reason().is_some();
+        }
+    }
+
+    pub(crate) fn indexed_fields(&self) -> Vec<String> {
+        self.fields
+            .iter()
+            .filter(|field| field.indexed)
+            .map(|field| field.name.clone())
+            .collect()
     }
 
     pub(crate) fn field(&self, name: &str) -> Option<&Field> {

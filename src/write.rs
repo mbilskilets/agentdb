@@ -1,14 +1,16 @@
 //! Writes to documents. One write or a batch of them runs as a single
 //! transaction: every write takes effect, or none does.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::change::{Change, ChangeKind};
 use crate::db::{AgentDb, Doc, all_defs, doc_exists, load_def, read_doc, record, to_json};
 use crate::error::{DbError, Result};
-use crate::schema::{FieldType, TableDef};
+use crate::index;
+use crate::query::sql_value;
+use crate::schema::TableDef;
 
 /// The most writes one [`AgentDb::batch`] call accepts.
 pub(crate) const MAX_BATCH: usize = 500;
@@ -151,10 +153,14 @@ fn insert(conn: &Connection, table: &str, doc: Value, at: &str) -> Result<Change
     def.check_required(&fields)?;
     check_references(conn, &def, &fields)?;
     let id: i64 = conn.query_row(
-        "UPDATE _tables SET next_id = next_id + 1 WHERE name = ?1 RETURNING next_id - 1",
+        "INSERT INTO _ids (name, next_id) VALUES (?1, 2)
+         ON CONFLICT (name) DO UPDATE SET next_id = next_id + 1
+         RETURNING next_id - 1",
         [table],
         |row| row.get(0),
     )?;
+    check_unique(conn, &def, &fields, id)?;
+    add_to_count(conn, table, 1)?;
     let doc = Doc {
         id,
         version: 1,
@@ -191,6 +197,7 @@ fn update(
     }
     def.check_required(&fields)?;
     check_references(conn, &def, &fields)?;
+    check_unique(conn, &def, &fields, id)?;
     let doc = Doc {
         id,
         version: current.version + 1,
@@ -220,6 +227,7 @@ fn delete(
         "DELETE FROM docs WHERE tbl = ?1 AND id = ?2",
         params![table, id],
     )?;
+    add_to_count(conn, table, -1)?;
     record(conn, ChangeKind::Delete, table, at, Some(doc))
 }
 
@@ -248,35 +256,62 @@ fn check_references(conn: &Connection, def: &TableDef, fields: &Map<String, Valu
     Ok(())
 }
 
+/// Refuses a value that another document already holds in a unique field.
+fn check_unique(
+    conn: &Connection,
+    def: &TableDef,
+    fields: &Map<String, Value>,
+    id: i64,
+) -> Result<()> {
+    for field in def.fields.iter().filter(|field| field.unique) {
+        let Some(value) = fields.get(&field.name) else {
+            continue;
+        };
+        let holder: Option<i64> = conn
+            .query_row(
+                &index::other_holder_sql(def, field),
+                params![sql_value(value)?, id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(holder) = holder {
+            return Err(DbError::DuplicateValue {
+                table: def.name.clone(),
+                field: field.name.clone(),
+                value: value.to_string(),
+                id: holder,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn check_not_referenced(conn: &Connection, table: &str, id: i64) -> Result<()> {
     for def in all_defs(conn)? {
-        for field in &def.fields {
-            if field.kind
-                != (FieldType::Ref {
-                    table: table.to_owned(),
-                })
-            {
-                continue;
-            }
-            let count: i64 = conn.query_row(
-                &format!(
-                    "SELECT count(*) FROM docs WHERE tbl = ?1 AND json_extract(body, '$.{}') = ?2",
-                    field.name
-                ),
-                params![def.name, id],
-                |row| row.get(0),
-            )?;
+        for field in def.fields.iter().filter(|field| field.links_to(table)) {
+            let count: i64 =
+                conn.query_row(&index::count_holders_sql(&def, field), [id], |row| {
+                    row.get(0)
+                })?;
             if count > 0 {
                 return Err(DbError::StillReferenced {
                     table: table.to_owned(),
                     id,
-                    by_table: def.name,
+                    by_table: def.name.clone(),
                     by_field: field.name.clone(),
                     count,
                 });
             }
         }
     }
+    Ok(())
+}
+
+fn add_to_count(conn: &Connection, table: &str, change: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE _tables SET count = count + ?2 WHERE name = ?1",
+        params![table, change],
+    )?;
     Ok(())
 }
 

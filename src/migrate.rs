@@ -3,16 +3,17 @@
 //! together in one transaction, or not at all. Changes that would delete
 //! data refuse unless `force` is set.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 
 use crate::change::ChangeKind;
 use crate::db::{
-    AgentDb, all_defs, check_ref_target, count_docs, doc_exists, from_json, load_def, record,
-    to_json,
+    AgentDb, all_defs, check_ref_target, count_docs, doc_exists, from_json, load_def, read_doc,
+    record, store_def, to_json,
 };
 use crate::error::{DbError, Result};
+use crate::index;
 use crate::schema::{Field, FieldType, TableDef, check_enum_value, check_name, validate_field};
 
 /// One change to the schema. Pass several to [`AgentDb::migrate`] to apply
@@ -47,6 +48,20 @@ pub enum SchemaChange {
         table: String,
         field: String,
         required: bool,
+    },
+    /// Lets queries filter and sort by the field without reading every
+    /// document, at the price of slightly slower writes.
+    SetIndexed {
+        table: String,
+        field: String,
+        indexed: bool,
+    },
+    /// Refuses two documents with the same value in the field. Changes
+    /// nothing if such documents already exist.
+    SetUnique {
+        table: String,
+        field: String,
+        unique: bool,
     },
     AddEnumValue {
         table: String,
@@ -88,15 +103,17 @@ impl AgentDb {
     /// [`DbError::StepFailed`], which says which step it was.
     pub fn migrate(&self, changes: &[SchemaChange]) -> Result<()> {
         self.write(|conn, at| {
-            changes
+            let events = changes
                 .iter()
                 .enumerate()
-                .map(|(index, change)| {
+                .map(|(step, change)| {
                     let table = apply(conn, change)
-                        .map_err(|source| source.at_step(index + 1, changes.len()))?;
+                        .map_err(|source| source.at_step(step + 1, changes.len()))?;
                     record(conn, ChangeKind::Schema, &table, at, None)
                 })
-                .collect()
+                .collect::<Result<Vec<_>>>()?;
+            index::sync(conn)?;
+            Ok(events)
         })?;
         Ok(())
     }
@@ -168,6 +185,35 @@ impl AgentDb {
             table: table.to_owned(),
             field: field.to_owned(),
             required,
+        }])
+    }
+
+    /// Turns the index on a field on or off. A table with more than 1,000
+    /// documents can only be filtered or sorted by indexed fields.
+    ///
+    /// # Errors
+    /// [`DbError::TooManyIndexes`] when the table already has 10 indexed
+    /// fields, [`DbError::IndexRequired`] when turning off the index of a
+    /// unique field or a ref.
+    pub fn set_indexed(&self, table: &str, field: &str, indexed: bool) -> Result<()> {
+        self.migrate(&[SchemaChange::SetIndexed {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            indexed,
+        }])
+    }
+
+    /// Makes a field unique, so no two documents may hold the same value in
+    /// it, or lifts that rule. A unique field is always indexed.
+    ///
+    /// # Errors
+    /// [`DbError::DuplicatesExist`] when documents already share a value;
+    /// nothing is changed in that case.
+    pub fn set_unique(&self, table: &str, field: &str, unique: bool) -> Result<()> {
+        self.migrate(&[SchemaChange::SetUnique {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            unique,
         }])
     }
 
@@ -256,6 +302,16 @@ fn apply(conn: &Connection, change: &SchemaChange) -> Result<String> {
             field,
             required,
         } => set_required(conn, table, field, *required).map(|()| table),
+        C::SetIndexed {
+            table,
+            field,
+            indexed,
+        } => set_indexed(conn, table, field, *indexed).map(|()| table),
+        C::SetUnique {
+            table,
+            field,
+            unique,
+        } => set_unique(conn, table, field, *unique).map(|()| table),
         C::AddEnumValue {
             table,
             field,
@@ -286,9 +342,11 @@ fn define_table(conn: &Connection, def: &TableDef) -> Result<()> {
     for field in &def.fields {
         check_ref_target(conn, &field.kind, Some(&def.name))?;
     }
+    let mut def = def.clone();
+    def.settle_indexes()?;
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO _tables (name, schema) VALUES (?1, ?2)",
-        params![def.name, to_json(def)?],
+        params![def.name, to_json(&def)?],
     )?;
     if inserted == 0 {
         return Err(DbError::TableExists {
@@ -317,7 +375,7 @@ fn add_field(conn: &Connection, table: &str, field: &Field) -> Result<()> {
         });
     }
     def.fields.push(field.clone());
-    save_def(conn, &def)
+    save_def(conn, &mut def)
 }
 
 fn rename_table(conn: &Connection, table: &str, new_name: &str) -> Result<()> {
@@ -339,9 +397,14 @@ fn rename_table(conn: &Connection, table: &str, new_name: &str) -> Result<()> {
             params![table, new_name],
         )?;
     }
+    conn.execute(
+        "INSERT INTO _ids (name, next_id) SELECT ?2, next_id FROM _ids WHERE name = ?1
+         ON CONFLICT (name) DO UPDATE SET next_id = max(next_id, excluded.next_id)",
+        params![table, new_name],
+    )?;
     for mut other in all_defs(conn)? {
         if retarget(&mut other, table, new_name) {
-            save_def(conn, &other)?;
+            save_def(conn, &mut other)?;
         }
     }
     Ok(())
@@ -358,7 +421,7 @@ fn rename_field(conn: &Connection, table: &str, field: &str, new_name: &str) -> 
     let target = field_mut(&mut def, field)?;
     new_name.clone_into(&mut target.name);
     validate_field(target)?;
-    save_def(conn, &def)?;
+    save_def(conn, &mut def)?;
     for (id, mut fields) in load_rows(conn, table)? {
         if let Some(value) = fields.remove(field) {
             fields.insert(new_name.to_owned(), value);
@@ -374,7 +437,8 @@ fn change_type(conn: &Connection, table: &str, field: &str, to: &FieldType) -> R
     let target = field_mut(&mut def, field)?;
     target.kind = to.clone();
     validate_field(target)?;
-    save_def(conn, &def)?;
+    let unique = target.unique;
+    save_def(conn, &mut def)?;
     let mut misfits: Vec<(i64, Value)> = Vec::new();
     for (id, mut fields) in load_rows(conn, table)? {
         let Some(value) = fields.get(field).cloned() else {
@@ -389,6 +453,7 @@ fn change_type(conn: &Connection, table: &str, field: &str, to: &FieldType) -> R
         }
     }
     match misfits.first() {
+        None if unique => check_no_duplicates(conn, table, field),
         None => Ok(()),
         Some((example_id, example)) => Err(DbError::CannotConvert {
             table: table.to_owned(),
@@ -450,7 +515,59 @@ fn set_required(conn: &Connection, table: &str, field: &str, required: bool) -> 
             count: missing,
         });
     }
-    save_def(conn, &def)
+    save_def(conn, &mut def)
+}
+
+fn set_indexed(conn: &Connection, table: &str, field: &str, indexed: bool) -> Result<()> {
+    let mut def = load_def(conn, table)?;
+    let target = field_mut(&mut def, field)?;
+    if let (false, Some(reason)) = (indexed, target.index_reason()) {
+        return Err(DbError::IndexRequired {
+            table: table.to_owned(),
+            field: field.to_owned(),
+            reason,
+        });
+    }
+    target.indexed = indexed;
+    save_def(conn, &mut def)
+}
+
+fn set_unique(conn: &Connection, table: &str, field: &str, unique: bool) -> Result<()> {
+    let mut def = load_def(conn, table)?;
+    field_mut(&mut def, field)?.unique = unique;
+    if unique {
+        check_no_duplicates(conn, table, field)?;
+    }
+    save_def(conn, &mut def)
+}
+
+/// Refuses when two documents of `table` hold the same value in `field`,
+/// which the caller has already found in the schema.
+fn check_no_duplicates(conn: &Connection, table: &str, field: &str) -> Result<()> {
+    let value = index::value_of(field);
+    let duplicate: Option<(i64, i64, i64)> = conn
+        .query_row(
+            &format!(
+                "SELECT count(*), min(id), max(id) FROM docs
+                 WHERE tbl = ?1 AND {value} IS NOT NULL
+                 GROUP BY {value} HAVING count(*) > 1 ORDER BY min(id) LIMIT 1"
+            ),
+            [table],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((count, first_id, second_id)) = duplicate else {
+        return Ok(());
+    };
+    let shared = read_doc(conn, table, first_id)?.fields.remove(field);
+    Err(DbError::DuplicatesExist {
+        table: table.to_owned(),
+        field: field.to_owned(),
+        value: shared.unwrap_or_default().to_string(),
+        count,
+        first_id,
+        second_id,
+    })
 }
 
 fn enum_values<'a>(def: &'a mut TableDef, table: &str, field: &str) -> Result<&'a mut Vec<String>> {
@@ -475,7 +592,7 @@ fn add_enum_value(conn: &Connection, table: &str, field: &str, value: &str) -> R
         });
     }
     values.push(value.to_owned());
-    save_def(conn, &def)
+    save_def(conn, &mut def)
 }
 
 fn remove_enum_value(conn: &Connection, table: &str, field: &str, value: &str) -> Result<()> {
@@ -496,7 +613,8 @@ fn remove_enum_value(conn: &Connection, table: &str, field: &str, value: &str) -
     }
     let count: i64 = conn.query_row(
         &format!(
-            "SELECT count(*) FROM docs WHERE tbl = ?1 AND json_extract(body, '$.{field}') = ?2"
+            "SELECT count(*) FROM docs WHERE tbl = ?1 AND {} = ?2",
+            index::value_of(field)
         ),
         params![table, value],
         |row| row.get(0),
@@ -510,7 +628,7 @@ fn remove_enum_value(conn: &Connection, table: &str, field: &str, value: &str) -
         });
     }
     values.retain(|existing| existing != value);
-    save_def(conn, &def)
+    save_def(conn, &mut def)
 }
 
 fn describe(conn: &Connection, table: &str, field: Option<&str>, description: &str) -> Result<()> {
@@ -520,7 +638,7 @@ fn describe(conn: &Connection, table: &str, field: Option<&str>, description: &s
         Some(field) => field_mut(&mut def, field)?.description = text,
         None => def.description = text,
     }
-    save_def(conn, &def)
+    save_def(conn, &mut def)
 }
 
 fn remove_field(conn: &Connection, table: &str, field: &str, force: bool) -> Result<()> {
@@ -534,7 +652,7 @@ fn remove_field(conn: &Connection, table: &str, field: &str, force: bool) -> Res
         });
     }
     def.fields.retain(|existing| existing.name != field);
-    save_def(conn, &def)?;
+    save_def(conn, &mut def)?;
     for (id, mut fields) in load_rows(conn, table)? {
         if fields.remove(field).is_some() {
             store_row(conn, table, id, &fields)?;
@@ -546,7 +664,7 @@ fn remove_field(conn: &Connection, table: &str, field: &str, force: bool) -> Res
 fn drop_table(conn: &Connection, table: &str, force: bool) -> Result<()> {
     load_def(conn, table)?;
     for other in all_defs(conn)? {
-        let link = other.fields.iter().find(|field| links_to(field, table));
+        let link = other.fields.iter().find(|field| field.links_to(table));
         if let Some(link) = link
             && other.name != table
         {
@@ -567,10 +685,6 @@ fn drop_table(conn: &Connection, table: &str, force: bool) -> Result<()> {
     conn.execute("DELETE FROM docs WHERE tbl = ?1", [table])?;
     conn.execute("DELETE FROM _tables WHERE name = ?1", [table])?;
     Ok(())
-}
-
-fn links_to(field: &Field, table: &str) -> bool {
-    matches!(&field.kind, FieldType::Ref { table: target } if target == table)
 }
 
 /// Points every link to `from` at `to` instead. Returns whether any changed.
@@ -595,19 +709,20 @@ fn field_mut<'a>(def: &'a mut TableDef, name: &str) -> Result<&'a mut Field> {
         .ok_or(unknown)
 }
 
-fn save_def(conn: &Connection, def: &TableDef) -> Result<()> {
-    conn.execute(
-        "UPDATE _tables SET schema = ?2 WHERE name = ?1",
-        params![def.name, to_json(def)?],
-    )?;
-    Ok(())
+/// Stores a changed definition, with an index on every field that needs one.
+fn save_def(conn: &Connection, def: &mut TableDef) -> Result<()> {
+    def.settle_indexes()?;
+    store_def(conn, def)
 }
 
-/// How many documents hold a value for `field`. The name comes from the
-/// schema, so it is safe to place in the SQL text.
+/// How many documents hold a value for `field`, which the caller has
+/// already found in the schema.
 fn count_set(conn: &Connection, table: &str, field: &str) -> Result<i64> {
     Ok(conn.query_row(
-        &format!("SELECT count(*) FROM docs WHERE tbl = ?1 AND json_extract(body, '$.{field}') IS NOT NULL"),
+        &format!(
+            "SELECT count(*) FROM docs WHERE tbl = ?1 AND {} IS NOT NULL",
+            index::value_of(field)
+        ),
         [table],
         |row| row.get(0),
     )?)

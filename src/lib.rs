@@ -7,6 +7,8 @@ mod ask;
 mod change;
 mod db;
 mod error;
+mod format;
+mod index;
 mod jev;
 mod migrate;
 mod query;

@@ -4,12 +4,17 @@ use rusqlite::types::Value as SqlValue;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::db::DOC_COLUMNS;
 use crate::error::{DbError, Result};
+use crate::index;
 use crate::schema::{FieldType, TableDef};
 
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 500;
 const LOWERCASE: &str = "agentdb_lowercase";
+/// A table with more documents than this is only searched through an index.
+pub(crate) const MAX_SCAN_DOCS: i64 = 1_000;
+const INDEXED_SYSTEM_FIELDS: [&str; 3] = ["id", "created_at", "updated_at"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +41,11 @@ impl Op {
             Self::Lte => "lte",
             Self::Contains => "contains",
         }
+    }
+
+    /// Whether an index on the field can answer a filter with this operator.
+    const fn can_use_index(self) -> bool {
+        !matches!(self, Self::Ne | Self::Contains)
     }
 
     const fn sql(self) -> &'static str {
@@ -137,59 +147,190 @@ impl Query {
         self.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT)
     }
 
-    pub(crate) fn compile(&self, def: &TableDef) -> Result<Compiled> {
-        let mut conditions = String::new();
+    /// Turns the query into SQL. `table_size` is how many documents the
+    /// table holds: above [`MAX_SCAN_DOCS`] the query has to be one that an
+    /// index can answer.
+    pub(crate) fn compile(&self, def: &TableDef, table_size: i64) -> Result<Compiled> {
+        let mut conditions = index::rows_of(def);
         let mut params = Vec::new();
+        let mut narrowing = Vec::new();
         for filter in &self.filters {
-            let (clause, param) = compile_filter(def, filter)?;
+            let column = column(def, &filter.field)?;
+            let (clause, param) = compile_filter(def, filter, &column)?;
             conditions = format!("{conditions} AND {clause}");
             params.extend(param);
+            narrowing.extend(column.narrowing(filter.op));
         }
-        let order = match &self.sort {
-            Some(sort) => {
-                let (column, _) = column(def, &sort.field)?;
-                let direction = if sort.descending { "DESC" } else { "ASC" };
-                format!("{column} {direction}, id ASC")
-            }
-            None => "id ASC".to_owned(),
+        let sorted_by = column(def, self.sort.as_ref().map_or("id", |sort| &sort.field))?;
+        let narrowest = narrowing
+            .into_iter()
+            .min_by_key(|(precision, _)| *precision)
+            .map(|(_, index)| index);
+        let index = match narrowest {
+            None if self.filters.is_empty() => sorted_by.index,
+            narrowest => narrowest,
+        };
+        let source = match index {
+            Some(index) => index::docs_by(&index),
+            None if table_size <= MAX_SCAN_DOCS => "docs".to_owned(),
+            None => return Err(self.needs_index(def, table_size)),
+        };
+        let direction = match &self.sort {
+            Some(sort) if sort.descending => "DESC",
+            _ => "ASC",
+        };
+        let order = if sorted_by.sql == "id" {
+            format!("id {direction}")
+        } else {
+            format!("{} {direction}, id {direction}", sorted_by.sql)
         };
         Ok(Compiled {
+            source,
             conditions,
             params,
             order,
         })
     }
-}
 
-#[derive(Debug)]
-pub(crate) struct Compiled {
-    /// Zero or more ` AND ...` clauses, each using `?` placeholders.
-    pub conditions: String,
-    pub params: Vec<SqlValue>,
-    pub order: String,
-}
-
-/// The SQL expression and type for a field. Field names come from the schema,
-/// never from the caller, so they are safe to place in the SQL text.
-fn column(def: &TableDef, name: &str) -> Result<(String, FieldType)> {
-    match name {
-        "id" | "version" => Ok((name.to_owned(), FieldType::Number)),
-        "created_at" | "updated_at" => Ok((name.to_owned(), FieldType::Datetime)),
-        _ => {
-            let field = def
-                .field(name)
-                .ok_or_else(|| def.unknown_field(name, true))?;
-            Ok((
-                format!("json_extract(body, '$.{}')", field.name),
-                field.kind.clone(),
-            ))
+    /// Says why no index can answer this query and what would change that.
+    fn needs_index(&self, def: &TableDef, table_size: i64) -> DbError {
+        let own_field = |name: &str| def.field(name).map(|field| field.name.clone());
+        let indexable = self
+            .filters
+            .iter()
+            .find(|filter| filter.op.can_use_index() && def.field(&filter.field).is_some());
+        let (unserved, could_index) = match indexable.or_else(|| self.filters.first()) {
+            Some(filter) if filter.op.can_use_index() => (
+                format!("The filter on `{}` has no index to use", filter.field),
+                own_field(&filter.field),
+            ),
+            Some(filter) => (
+                format!(
+                    "The `{}` filter on `{}` cannot use an index (`ne` and `contains` never can)",
+                    filter.op.name(),
+                    filter.field
+                ),
+                None,
+            ),
+            None => {
+                let field = self.sort.as_ref().map_or("id", |sort| &sort.field);
+                (
+                    format!("The sort on `{field}` has no index to use"),
+                    own_field(field),
+                )
+            }
+        };
+        let mut indexed: Vec<String> = INDEXED_SYSTEM_FIELDS.map(str::to_owned).to_vec();
+        indexed.extend(def.indexed_fields());
+        DbError::QueryNeedsIndex {
+            table: def.name.clone(),
+            count: table_size,
+            limit: MAX_SCAN_DOCS,
+            unserved,
+            indexed,
+            could_index,
         }
     }
 }
 
-fn compile_filter(def: &TableDef, filter: &Filter) -> Result<(String, Option<SqlValue>)> {
-    let (column, kind) = column(def, &filter.field)?;
-    let allowed = allowed_ops(&kind);
+#[derive(Debug)]
+pub(crate) struct Compiled {
+    /// The `docs` table, read through the index chosen for the query when
+    /// one can answer it.
+    source: String,
+    /// What selects the table's documents, then every filter, with a `?` for
+    /// each of `params`.
+    conditions: String,
+    pub params: Vec<SqlValue>,
+    order: String,
+}
+
+impl Compiled {
+    pub(crate) fn count_sql(&self) -> String {
+        format!(
+            "SELECT count(*) FROM {} WHERE {}",
+            self.source, self.conditions
+        )
+    }
+
+    /// Takes the limit and the offset as two more values after `params`.
+    pub(crate) fn page_sql(&self) -> String {
+        format!(
+            "SELECT {DOC_COLUMNS} FROM {} WHERE {} ORDER BY {} LIMIT ? OFFSET ?",
+            self.source, self.conditions, self.order
+        )
+    }
+}
+
+/// What a filter or sort reads: a value the database sets, or a field of
+/// the document.
+struct Column {
+    sql: String,
+    kind: FieldType,
+    /// The index over this column, when it has one.
+    index: Option<String>,
+    unique: bool,
+}
+
+impl Column {
+    fn system(name: &str, kind: FieldType, index: Option<&str>) -> Self {
+        Self {
+            sql: name.to_owned(),
+            kind,
+            index: index.map(str::to_owned),
+            unique: name == "id",
+        }
+    }
+
+    /// The index that answers a filter with `op` on this column, and how
+    /// far it narrows the search: the lower, the fewer documents are left.
+    fn narrowing(&self, op: Op) -> Option<(u8, String)> {
+        let index = self.index.clone()?;
+        let precision = match op {
+            Op::Eq if self.unique => 0,
+            Op::Eq => 1,
+            Op::Gt | Op::Gte | Op::Lt | Op::Lte => 2,
+            Op::Ne | Op::Contains => return None,
+        };
+        Some((precision, index))
+    }
+}
+
+fn column(def: &TableDef, name: &str) -> Result<Column> {
+    match name {
+        "id" => Ok(Column::system(name, FieldType::Number, Some(index::BY_ID))),
+        "version" => Ok(Column::system(name, FieldType::Number, None)),
+        "created_at" => Ok(Column::system(
+            name,
+            FieldType::Datetime,
+            Some(index::BY_CREATED_AT),
+        )),
+        "updated_at" => Ok(Column::system(
+            name,
+            FieldType::Datetime,
+            Some(index::BY_UPDATED_AT),
+        )),
+        _ => {
+            let field = def
+                .field(name)
+                .ok_or_else(|| def.unknown_field(name, true))?;
+            Ok(Column {
+                sql: index::value_of(&field.name),
+                kind: field.kind.clone(),
+                index: field.indexed.then(|| index::of_field(def, field)),
+                unique: field.unique,
+            })
+        }
+    }
+}
+
+fn compile_filter(
+    def: &TableDef,
+    filter: &Filter,
+    column: &Column,
+) -> Result<(String, Option<SqlValue>)> {
+    let Column { sql, kind, .. } = column;
+    let allowed = allowed_ops(kind);
     if !allowed.contains(&filter.op) {
         return Err(DbError::InvalidOperator {
             field: filter.field.clone(),
@@ -200,8 +341,8 @@ fn compile_filter(def: &TableDef, filter: &Filter) -> Result<(String, Option<Sql
     }
     if filter.value.is_null() {
         return match filter.op {
-            Op::Eq => Ok((format!("{column} IS NULL"), None)),
-            Op::Ne => Ok((format!("{column} IS NOT NULL"), None)),
+            Op::Eq => Ok((format!("{sql} IS NULL"), None)),
+            Op::Ne => Ok((format!("{sql} IS NOT NULL"), None)),
             _ => Err(DbError::InvalidOperator {
                 field: filter.field.clone(),
                 op: filter.op.name().to_owned(),
@@ -213,12 +354,12 @@ fn compile_filter(def: &TableDef, filter: &Filter) -> Result<(String, Option<Sql
     let value = kind.coerce(&def.name, &filter.field, &filter.value)?;
     if let (Op::Contains, Value::String(needle)) = (filter.op, &value) {
         return Ok((
-            format!("instr({LOWERCASE}({column}), ?) > 0"),
+            format!("instr({LOWERCASE}({sql}), ?) > 0"),
             Some(SqlValue::Text(needle.to_lowercase())),
         ));
     }
     Ok((
-        format!("{column} {} ?", filter.op.sql()),
+        format!("{sql} {} ?", filter.op.sql()),
         Some(sql_value(&value)?),
     ))
 }
@@ -238,7 +379,7 @@ pub(crate) fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-fn sql_value(value: &Value) -> Result<SqlValue> {
+pub(crate) fn sql_value(value: &Value) -> Result<SqlValue> {
     match value {
         Value::String(text) => Ok(SqlValue::Text(text.clone())),
         Value::Bool(flag) => Ok(SqlValue::Integer(i64::from(*flag))),

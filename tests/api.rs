@@ -6,7 +6,7 @@ mod tests {
     use agentdb::{
         AgentDb, Change, ChangeKind, DbError, Field, FieldType, Op, Query, TableDef, Write,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::sync::broadcast::Receiver;
     use tokio::sync::broadcast::error::TryRecvError;
 
@@ -450,6 +450,227 @@ mod tests {
         let last = db.find(&query.offset(2)).unwrap();
         assert_eq!(last.docs.len(), 1);
         assert_eq!(last.next_offset, None);
+    }
+
+    #[test]
+    fn a_descending_sort_breaks_ties_by_descending_id() {
+        let db = crm();
+        for (name, revenue) in [("Acme", 5), ("Globex", 9), ("Initech", 5), ("Hooli", 5)] {
+            db.insert("clients", json!({"name": name, "revenue": revenue}))
+                .unwrap();
+        }
+        assert_eq!(
+            names(&db, &Query::table("clients").sort("revenue", false)),
+            ["Acme", "Initech", "Hooli", "Globex"]
+        );
+        assert_eq!(
+            names(&db, &Query::table("clients").sort("revenue", true)),
+            ["Globex", "Hooli", "Initech", "Acme"]
+        );
+        assert_eq!(
+            names(&db, &Query::table("clients").sort("id", true).limit(2)),
+            ["Hooli", "Initech"]
+        );
+    }
+
+    fn insert_many(db: &AgentDb, table: &str, docs: impl Iterator<Item = Value>) {
+        let writes: Vec<Write> = docs
+            .map(|doc| Write::Insert {
+                table: table.to_owned(),
+                doc,
+            })
+            .collect();
+        for batch in writes.chunks(500) {
+            db.batch(batch.to_vec()).unwrap();
+        }
+    }
+
+    fn event(n: i64) -> Value {
+        let kind = if n % 2 == 0 { "click" } else { "view" };
+        json!({"kind": kind, "score": n, "note": format!("note {n}"), "weight": n % 7})
+    }
+
+    fn events(count: i64) -> AgentDb {
+        let db = AgentDb::open_in_memory().unwrap();
+        db.define_table(
+            &TableDef::new("events")
+                .with(Field::new("kind", FieldType::Text, true).indexed())
+                .with(Field::new("score", FieldType::Number, true).indexed())
+                .required("note", FieldType::Text)
+                .required("weight", FieldType::Number),
+        )
+        .unwrap();
+        insert_many(&db, "events", (0..count).map(event));
+        db
+    }
+
+    fn total(db: &AgentDb, query: &Query) -> i64 {
+        db.find(query).unwrap().total
+    }
+
+    #[test]
+    fn a_table_of_up_to_1000_documents_answers_any_query() {
+        let db = events(1000);
+        let all = || Query::table("events");
+        assert_eq!(total(&db, &all().filter("weight", Op::Eq, 3)), 143);
+        assert_eq!(
+            total(&db, &all().filter("note", Op::Contains, "NOTE 99")),
+            11
+        );
+        assert_eq!(total(&db, &all().filter("kind", Op::Ne, "click")), 500);
+        let lightest = db.find(&all().sort("weight", false).limit(2)).unwrap();
+        let ids: Vec<i64> = lightest.docs.iter().map(|doc| doc.id).collect();
+        assert_eq!(ids, [1, 8]);
+    }
+
+    const TOO_LARGE: &str = "cannot run this query: `events` holds 1001 documents, and a table with more than 1000 is only searched through an index.";
+    const INDEXED: &str = "Indexed fields: id, created_at, updated_at, kind, score. Add a filter with eq, gt, gte, lt or lte on one of them";
+    const INDEX_WEIGHT: &str = r#", or index `weight` first with the schema change {"op": "set_indexed", "table": "events", "field": "weight", "indexed": true}."#;
+
+    #[test]
+    fn a_larger_table_refuses_a_query_no_index_can_answer() {
+        let db = events(1001);
+        let all = || Query::table("events");
+        assert_eq!(
+            message(db.find(&all().filter("weight", Op::Eq, 3))),
+            format!(
+                "{TOO_LARGE} The filter on `weight` has no index to use. {INDEXED}{INDEX_WEIGHT}"
+            )
+        );
+        assert_eq!(
+            message(db.find(&all().sort("weight", true))),
+            format!(
+                "{TOO_LARGE} The sort on `weight` has no index to use. {INDEXED}{INDEX_WEIGHT}"
+            )
+        );
+        assert_eq!(
+            message(db.find(&all().filter("note", Op::Contains, "note 99"))),
+            format!(
+                "{TOO_LARGE} The `contains` filter on `note` cannot use an index (`ne` and `contains` never can). {INDEXED}."
+            )
+        );
+        assert_eq!(
+            message(
+                db.find(
+                    &all()
+                        .filter("kind", Op::Ne, "click")
+                        .filter("weight", Op::Lt, 2)
+                )
+            ),
+            format!(
+                "{TOO_LARGE} The filter on `weight` has no index to use. {INDEXED}{INDEX_WEIGHT}"
+            )
+        );
+        let unindexed_system_field = db.find(&all().filter("version", Op::Eq, 1));
+        assert!(matches!(
+            unindexed_system_field,
+            Err(DbError::QueryNeedsIndex {
+                could_index: None,
+                ..
+            })
+        ));
+        assert_eq!(
+            unindexed_system_field.unwrap_err().code(),
+            "query_needs_index"
+        );
+
+        db.set_indexed("events", "weight", true).unwrap();
+        assert_eq!(total(&db, &all().filter("weight", Op::Eq, 3)), 143);
+        let heaviest = db.find(&all().sort("weight", true).limit(2)).unwrap();
+        let ids: Vec<i64> = heaviest.docs.iter().map(|doc| doc.id).collect();
+        assert_eq!(ids, [1001, 994]);
+    }
+
+    #[test]
+    fn a_larger_table_answers_queries_an_index_can_narrow() {
+        let db = events(1001);
+        let all = || Query::table("events");
+        assert_eq!(total(&db, &all()), 1001);
+        assert_eq!(db.find(&all()).unwrap().next_offset, Some(50));
+        assert_eq!(total(&db, &all().filter("kind", Op::Eq, "click")), 501);
+        assert_eq!(total(&db, &all().filter("score", Op::Gte, 990)), 11);
+        assert_eq!(total(&db, &all().filter("id", Op::Gt, 1000)), 1);
+        assert_eq!(
+            total(&db, &all().filter("created_at", Op::Gte, "2020-01-01")),
+            1001
+        );
+        assert_eq!(
+            total(
+                &db,
+                &all()
+                    .filter("kind", Op::Ne, "click")
+                    .filter("score", Op::Lt, 10)
+            ),
+            5
+        );
+        let on_top_of_an_index = all()
+            .filter("kind", Op::Eq, "view")
+            .filter("note", Op::Contains, "note 99")
+            .filter("weight", Op::Gte, 0)
+            .sort("weight", true);
+        let page = db.find(&on_top_of_an_index).unwrap();
+        let scores: Vec<_> = page.docs.iter().map(|doc| &doc.fields["score"]).collect();
+        assert_eq!(scores, [993, 999, 991, 997, 995, 99]);
+        let top = db.find(&all().sort("score", true).limit(3)).unwrap();
+        let scores: Vec<_> = top.docs.iter().map(|doc| &doc.fields["score"]).collect();
+        assert_eq!(scores, [1000, 999, 998]);
+    }
+
+    fn people() -> AgentDb {
+        let db = AgentDb::open_in_memory().unwrap();
+        db.define_table(
+            &TableDef::new("people")
+                .required("name", FieldType::Text)
+                .with(Field::new("email", FieldType::Text, false).unique()),
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn a_unique_field_refuses_a_second_document_with_the_same_value() {
+        let db = people();
+        let ann = json!({"name": "Ann", "email": "ann@acme.io"});
+        db.insert("people", ann.clone()).unwrap();
+        db.insert("people", json!({"name": "Bob"})).unwrap();
+        db.insert("people", json!({"name": "Cy"})).unwrap();
+        let duplicate = "`email` must be unique on `people`, and `people` id 1 already holds \"ann@acme.io\". Update that document instead of adding another one, or use a different value.";
+        assert_eq!(message(db.insert("people", ann.clone())), duplicate);
+        assert_eq!(
+            message(db.update("people", 2, json!({"email": "ann@acme.io"}), None)),
+            duplicate
+        );
+        assert_eq!(
+            db.insert("people", ann.clone()).unwrap_err().code(),
+            "duplicate_value"
+        );
+        assert_eq!(db.find(&Query::table("people")).unwrap().total, 3);
+
+        db.update(
+            "people",
+            1,
+            json!({"name": "Ann B", "email": "ann@acme.io"}),
+            None,
+        )
+        .unwrap();
+        db.update("people", 2, json!({"email": "Ann@acme.io"}), None)
+            .unwrap();
+        db.delete("people", 1, None).unwrap();
+        assert_eq!(db.insert("people", ann).unwrap().id, 4);
+    }
+
+    #[test]
+    fn a_batch_cannot_slip_two_equal_values_into_a_unique_field() {
+        let db = people();
+        let insert = |name: &str| Write::Insert {
+            table: "people".to_owned(),
+            doc: json!({"name": name, "email": "twin@acme.io"}),
+        };
+        assert_eq!(
+            message(db.batch(vec![insert("Ann"), insert("Bob")])),
+            "step 2 of 2 failed, so none of the 2 changes were applied: `email` must be unique on `people`, and `people` id 1 already holds \"twin@acme.io\". Update that document instead of adding another one, or use a different value."
+        );
+        assert_eq!(db.find(&Query::table("people")).unwrap().total, 0);
     }
 
     #[test]

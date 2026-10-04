@@ -13,39 +13,15 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::broadcast;
 
-use crate::ask::{self, Asked};
+use crate::ask::{self, Asked, Plan};
 use crate::change::{Change, ChangeKind};
 use crate::error::{DbError, Result};
+use crate::format::prepare;
 use crate::jev::Judge;
 use crate::query::{Query, register_functions};
 use crate::schema::{Field, FieldType, TableDef, closest, format_utc};
 
-const SETUP: &str = "
-CREATE TABLE IF NOT EXISTS _tables (
-    name TEXT PRIMARY KEY,
-    schema TEXT NOT NULL,
-    next_id INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS docs (
-    tbl TEXT NOT NULL,
-    id INTEGER NOT NULL,
-    version INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    body TEXT NOT NULL,
-    PRIMARY KEY (tbl, id)
-);
-CREATE TABLE IF NOT EXISTS changes (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    tbl TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    at TEXT NOT NULL,
-    doc TEXT NOT NULL
-);
-";
-/// Bumped whenever the layout of the storage tables changes.
-const FORMAT_VERSION: i64 = 1;
-const DOC_COLUMNS: &str = "id, version, created_at, updated_at, body";
+pub(crate) const DOC_COLUMNS: &str = "id, version, created_at, updated_at, body";
 const CHANGES_PER_CALL: i64 = 500;
 /// The change log keeps this many of the newest changes and drops the rest.
 pub(crate) const RETAINED_CHANGES: i64 = 10_000;
@@ -180,14 +156,25 @@ impl AgentDb {
     pub fn ask(&self, judge: &dyn Judge, text: &str) -> Result<Asked> {
         let defs = self.read(all_defs)?;
         let plan = ask::plan(&defs, text, self.now()?.date(), judge)?;
-        let page = match (&plan.query, &plan.refusal) {
-            (Some(query), None) => Some(self.find(query)?),
-            _ => None,
+        self.answer(plan)
+    }
+
+    /// Runs the query of a plan that was not refused. A query the table is
+    /// too large to answer without an index becomes a refusal: the request
+    /// was understood, and the caller gets the query along with the reason.
+    fn answer(&self, plan: Plan) -> Result<Asked> {
+        let (page, refusal) = match (&plan.query, plan.refusal) {
+            (Some(query), None) => match self.find(query) {
+                Ok(page) => (Some(page), None),
+                Err(error @ DbError::QueryNeedsIndex { .. }) => (None, Some(error.to_string())),
+                Err(error) => return Err(error),
+            },
+            (_, refusal) => (None, refusal),
         };
         Ok(Asked {
             query: plan.query,
             confidence: plan.confidence,
-            refusal: plan.refusal,
+            refusal,
             page,
             usage: plan.usage,
         })
@@ -256,33 +243,34 @@ impl AgentDb {
         })
     }
 
-    /// Returns the documents matching `query`, one page at a time.
+    /// Returns the documents matching `query`, one page at a time. Skipping
+    /// to a far `offset` costs time in proportion to the offset.
     ///
     /// # Errors
     /// Fails when the query names an unknown table or field, or uses an
     /// operator or value the field's type does not accept.
+    /// [`DbError::QueryNeedsIndex`] when the table holds more than 1,000
+    /// documents and no index can answer the query.
     pub fn find(&self, query: &Query) -> Result<Page> {
         self.read(|conn| {
             let def = load_def(conn, &query.table)?;
-            let compiled = query.compile(&def)?;
-            let mut params = vec![SqlValue::Text(query.table.clone())];
-            params.extend(compiled.params);
-            let total: i64 = conn.query_row(
-                &format!(
-                    "SELECT count(*) FROM docs WHERE tbl = ?{}",
-                    compiled.conditions
-                ),
-                params_from_iter(params.iter()),
-                |row| row.get(0),
-            )?;
+            let table_size = count_docs(conn, &def.name)?;
+            let compiled = query.compile(&def, table_size)?;
+            let total = if query.filters.is_empty() {
+                table_size
+            } else {
+                conn.query_row(
+                    &compiled.count_sql(),
+                    params_from_iter(compiled.params.iter()),
+                    |row| row.get(0),
+                )?
+            };
+            let page_sql = compiled.page_sql();
+            let mut params = compiled.params;
             params.push(SqlValue::Integer(i64::from(query.effective_limit())));
             params.push(SqlValue::Integer(i64::from(query.offset)));
-            let sql = format!(
-                "SELECT {DOC_COLUMNS} FROM docs WHERE tbl = ?{} ORDER BY {} LIMIT ? OFFSET ?",
-                compiled.conditions, compiled.order
-            );
             let docs = conn
-                .prepare(&sql)?
+                .prepare(&page_sql)?
                 .query_map(params_from_iter(params.iter()), raw_doc)?
                 .map(|raw| raw.map_err(DbError::from).and_then(RawDoc::into_doc))
                 .collect::<Result<Vec<Doc>>>()?;
@@ -374,22 +362,6 @@ fn connect(path: &Path, key: &str) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Creates the storage tables in a new file.
-fn prepare(conn: &mut Connection) -> Result<()> {
-    let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let found: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if found > FORMAT_VERSION {
-        return Err(DbError::NewerFormat {
-            found,
-            supported: FORMAT_VERSION,
-        });
-    }
-    transaction.execute_batch(SETUP)?;
-    transaction.pragma_update(None, "user_version", FORMAT_VERSION)?;
-    transaction.commit()?;
-    Ok(())
-}
-
 fn lock(conn: &Mutex<Connection>) -> Result<MutexGuard<'_, Connection>> {
     conn.lock()
         .map_err(|error| DbError::Internal(error.to_string()))
@@ -466,11 +438,11 @@ pub(crate) fn doc_exists(conn: &Connection, table: &str, id: i64) -> Result<bool
 }
 
 pub(crate) fn count_docs(conn: &Connection, table: &str) -> Result<i64> {
-    Ok(
-        conn.query_row("SELECT count(*) FROM docs WHERE tbl = ?1", [table], |row| {
-            row.get(0)
-        })?,
-    )
+    Ok(conn.query_row(
+        "SELECT count FROM _tables WHERE name = ?1",
+        [table],
+        |row| row.get(0),
+    )?)
 }
 
 pub(crate) fn all_defs(conn: &Connection) -> Result<Vec<TableDef>> {
@@ -497,6 +469,14 @@ pub(crate) fn load_def(conn: &Connection, table: &str) -> Result<TableDef> {
         suggestion: closest(table, &available),
         available,
     })
+}
+
+pub(crate) fn store_def(conn: &Connection, def: &TableDef) -> Result<()> {
+    conn.execute(
+        "UPDATE _tables SET schema = ?2 WHERE name = ?1",
+        params![def.name, to_json(def)?],
+    )?;
+    Ok(())
 }
 
 /// A reference field must point to an existing table, or to the table being
@@ -540,4 +520,74 @@ pub(crate) fn to_json<T: Serialize>(value: &T) -> Result<String> {
 
 pub(crate) fn from_json<T: DeserializeOwned>(text: &str) -> Result<T> {
     serde_json::from_str(text).map_err(|error| DbError::Internal(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::AgentDb;
+    use crate::ask::Plan;
+    use crate::jev::Usage;
+    use crate::query::MAX_SCAN_DOCS;
+    use crate::{DbError, FieldType, Op, Query, TableDef, Write};
+
+    fn notes_db(count: i64) -> AgentDb {
+        let db = AgentDb::open_in_memory().unwrap();
+        db.define_table(&TableDef::new("notes").required("text", FieldType::Text))
+            .unwrap();
+        let writes = (0..count).map(|_| Write::Insert {
+            table: "notes".to_owned(),
+            doc: json!({"text": "hello"}),
+        });
+        for batch in writes.collect::<Vec<_>>().chunks(500) {
+            db.batch(batch.to_vec()).unwrap();
+        }
+        db
+    }
+
+    fn understood(query: Query) -> Plan {
+        Plan {
+            query: Some(query),
+            confidence: 0.9,
+            refusal: None,
+            usage: Usage::default(),
+        }
+    }
+
+    #[test]
+    fn ask_refuses_a_request_that_no_index_can_answer() {
+        let db = notes_db(MAX_SCAN_DOCS + 1);
+        let query = Query::table("notes").filter("text", Op::Eq, "hello");
+        let asked = db.answer(understood(query.clone())).unwrap();
+        assert_eq!(asked.query, Some(query.clone()));
+        assert_eq!(asked.page, None);
+        assert_eq!(
+            asked.refusal,
+            db.find(&query).err().map(|error| error.to_string())
+        );
+        assert!(matches!(
+            db.find(&query),
+            Err(DbError::QueryNeedsIndex { .. })
+        ));
+    }
+
+    #[test]
+    fn ask_runs_a_request_that_a_small_table_can_answer() {
+        let db = notes_db(3);
+        let query = Query::table("notes").filter("text", Op::Eq, "hello");
+        let asked = db.answer(understood(query)).unwrap();
+        assert_eq!(asked.refusal, None);
+        assert_eq!(asked.page.map(|page| page.total), Some(3));
+    }
+
+    #[test]
+    fn ask_still_fails_on_errors_the_caller_must_see() {
+        let db = notes_db(0);
+        let missing = Query::table("notes").filter("title", Op::Eq, "hello");
+        assert!(matches!(
+            db.answer(understood(missing)),
+            Err(DbError::UnknownField { .. })
+        ));
+    }
 }

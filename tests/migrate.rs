@@ -4,6 +4,7 @@ mod tests {
 
     use agentdb::{
         AgentDb, Change, ChangeKind, DbError, Field, FieldType, Op, Query, SchemaChange, TableDef,
+        Write,
     };
     use serde_json::json;
     use tokio::sync::broadcast::Receiver;
@@ -221,6 +222,265 @@ mod tests {
             .map(|change| change.table)
             .collect();
         assert_eq!(tables, ["companies", "customers", "customers"]);
+    }
+
+    #[test]
+    fn ids_continue_after_a_table_is_dropped_and_defined_again() {
+        let db = crm();
+        let notes = TableDef::new("notes").required("text", FieldType::Text);
+        db.define_table(&notes).unwrap();
+        for text in ["one", "two", "three"] {
+            db.insert("notes", json!({"text": text})).unwrap();
+        }
+        db.drop_table("notes", true).unwrap();
+        db.define_table(&notes).unwrap();
+        assert_eq!(db.insert("notes", json!({"text": "four"})).unwrap().id, 4);
+
+        db.rename_table("notes", "memos").unwrap();
+        db.define_table(&notes).unwrap();
+        assert_eq!(db.insert("notes", json!({"text": "five"})).unwrap().id, 5);
+        assert_eq!(db.insert("memos", json!({"text": "six"})).unwrap().id, 5);
+
+        db.drop_table("memos", true).unwrap();
+        db.rename_table("notes", "memos").unwrap();
+        assert_eq!(db.insert("memos", json!({"text": "seven"})).unwrap().id, 6);
+    }
+
+    fn people() -> AgentDb {
+        let db = AgentDb::open_in_memory().unwrap();
+        db.define_table(
+            &TableDef::new("people")
+                .required("name", FieldType::Text)
+                .optional("email", FieldType::Text)
+                .optional("age", FieldType::Text),
+        )
+        .unwrap();
+        for (name, email, age) in [
+            ("Ann", Some("ann@acme.io"), "41"),
+            ("Bob", Some("bob@acme.io"), "41.0"),
+            ("Cy", None, "29"),
+            ("Di", Some("bob@acme.io"), "30"),
+            ("Ed", None, "31"),
+        ] {
+            db.insert("people", json!({"name": name, "email": email, "age": age}))
+                .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn a_field_cannot_become_unique_while_documents_share_a_value() {
+        let db = people();
+        assert_eq!(
+            message(db.set_unique("people", "email", true)),
+            "cannot make `email` unique on `people`: 2 documents hold \"bob@acme.io\", for example ids 2 and 4. Change or delete all but one of them first; nothing was changed."
+        );
+        db.insert("people", json!({"name": "Flo", "email": "ann@acme.io"}))
+            .unwrap();
+        db.delete("people", 6, None).unwrap();
+
+        db.update("people", 4, json!({"email": "di@acme.io"}), None)
+            .unwrap();
+        db.set_unique("people", "email", true).unwrap();
+        assert!(matches!(
+            db.insert("people", json!({"name": "Flo", "email": "ann@acme.io"})),
+            Err(DbError::DuplicateValue { id: 1, .. })
+        ));
+        db.insert("people", json!({"name": "Flo"})).unwrap();
+
+        db.set_unique("people", "email", false).unwrap();
+        db.insert("people", json!({"name": "Gus", "email": "ann@acme.io"}))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_type_change_cannot_make_a_unique_field_hold_duplicates() {
+        let db = people();
+        db.set_unique("people", "age", true).unwrap();
+        assert_eq!(
+            message(db.change_field_type("people", "age", FieldType::Number)),
+            "cannot make `age` unique on `people`: 2 documents hold 41, for example ids 1 and 2. Change or delete all but one of them first; nothing was changed."
+        );
+        assert_eq!(db.get("people", 2).unwrap().fields["age"], "41.0");
+        db.update("people", 2, json!({"age": "42"}), None).unwrap();
+        db.change_field_type("people", "age", FieldType::Number)
+            .unwrap();
+        assert!(matches!(
+            db.update("people", 3, json!({"age": 42.0}), None),
+            Err(DbError::DuplicateValue { id: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn unique_and_ref_fields_are_always_indexed() {
+        let db = crm();
+        db.set_unique("clients", "mail", true).unwrap();
+        let tables = serde_json::to_value(db.describe().unwrap()).unwrap();
+        let clients = tables
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|table| table["name"] == "clients")
+            .unwrap();
+        assert_eq!(
+            clients["fields"],
+            json!([
+                {"name": "name", "type": "text", "required": true},
+                {"name": "mail", "type": "text", "required": false, "indexed": true, "unique": true},
+                {"name": "vip", "type": "bool", "required": false},
+                {"name": "status", "type": "enum", "values": ["lead"], "required": false},
+                {"name": "company", "type": "ref", "table": "companies", "required": false, "indexed": true},
+            ])
+        );
+        assert_eq!(
+            message(db.set_indexed("clients", "mail", false)),
+            "`mail` on `clients` has to stay indexed because it is unique; turn that off first with the set_unique schema change."
+        );
+        assert_eq!(
+            message(db.set_indexed("clients", "company", false)),
+            "`company` on `clients` has to stay indexed because it is a ref, and deleting a document looks up what points to it."
+        );
+        db.set_unique("clients", "mail", false).unwrap();
+        db.set_indexed("clients", "mail", false).unwrap();
+        assert!(matches!(
+            db.set_indexed("clients", "phone", true),
+            Err(DbError::UnknownField { .. })
+        ));
+    }
+
+    #[test]
+    fn a_table_is_limited_to_10_indexed_fields() {
+        let db = crm();
+        let wide = (0..11).fold(TableDef::new("wide"), |def, n| {
+            def.with(Field::new(format!("f{n}"), FieldType::Text, false).indexed())
+        });
+        assert_eq!(
+            message(db.define_table(&wide)),
+            "table `wide` cannot have more than 10 indexed fields, because every index slows down each write. It would have these: f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10. Ref and unique fields are always indexed. Stop indexing a field that no query filters or sorts by, using the schema change {\"op\": \"set_indexed\", \"table\": \"wide\", \"field\": \"<field>\", \"indexed\": false}."
+        );
+        let mut fits = wide;
+        fits.fields.truncate(10);
+        db.define_table(&fits).unwrap();
+        let company = FieldType::Ref {
+            table: "companies".to_owned(),
+        };
+        assert!(matches!(
+            db.add_field("wide", Field::new("company", company, false)),
+            Err(DbError::TooManyIndexes { max: 10, .. })
+        ));
+        db.add_field("wide", Field::new("note", FieldType::Text, false))
+            .unwrap();
+        assert!(matches!(
+            db.set_unique("wide", "note", true),
+            Err(DbError::TooManyIndexes { .. })
+        ));
+        db.set_indexed("wide", "f0", false).unwrap();
+        db.set_unique("wide", "note", true).unwrap();
+    }
+
+    /// Enough documents that every query has to go through an index.
+    fn large() -> AgentDb {
+        let db = crm();
+        db.define_table(
+            &TableDef::new("events")
+                .with(Field::new("kind", FieldType::Text, true).indexed())
+                .with(Field::new("score", FieldType::Text, true).indexed())
+                .optional(
+                    "company",
+                    FieldType::Ref {
+                        table: "companies".to_owned(),
+                    },
+                ),
+        )
+        .unwrap();
+        let writes: Vec<Write> = (0..1001)
+            .map(|n| {
+                let kind = if n % 2 == 0 { "click" } else { "view" };
+                let company = (n == 7).then_some(1);
+                Write::Insert {
+                    table: "events".to_owned(),
+                    doc: json!({"kind": kind, "score": n.to_string(), "company": company}),
+                }
+            })
+            .collect();
+        for batch in writes.chunks(500) {
+            db.batch(batch.to_vec()).unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn indexes_keep_answering_queries_through_schema_changes() {
+        let db = large();
+        let total = |query: Query| db.find(&query).unwrap().total;
+        let changes: Vec<SchemaChange> = serde_json::from_value(json!([
+            {"op": "rename_field", "table": "events", "field": "kind", "new_name": "action"},
+            {"op": "change_type", "table": "events", "field": "score", "to": {"type": "number"}},
+            {"op": "rename_table", "table": "events", "new_name": "actions"},
+            {"op": "rename_table", "table": "companies", "new_name": "accounts"},
+        ]))
+        .unwrap();
+        db.migrate(&changes).unwrap();
+        let actions = || Query::table("actions");
+        assert_eq!(total(actions().filter("action", Op::Eq, "view")), 500);
+        assert_eq!(total(actions().filter("score", Op::Gte, 990)), 11);
+        assert_eq!(total(actions().filter("company", Op::Eq, 1)), 1);
+        assert_eq!(
+            message(db.delete("accounts", 1, None)),
+            "cannot delete `accounts` id 1: 1 document(s) in `actions` point to it through `company`. Update or delete those first."
+        );
+        db.update("actions", 8, json!({"company": null}), None)
+            .unwrap();
+        assert_eq!(
+            message(db.delete("accounts", 1, None)),
+            "cannot delete `accounts` id 1: 1 document(s) in `clients` point to it through `company`. Update or delete those first."
+        );
+        db.update("clients", 1, json!({"company": null}), None)
+            .unwrap();
+        db.delete("accounts", 1, None).unwrap();
+
+        db.set_indexed("actions", "action", false).unwrap();
+        assert!(matches!(
+            db.find(&actions().filter("action", Op::Eq, "view")),
+            Err(DbError::QueryNeedsIndex { .. })
+        ));
+        db.drop_table("actions", true).unwrap();
+        db.define_table(
+            &TableDef::new("actions").with(Field::new("score", FieldType::Number, true).indexed()),
+        )
+        .unwrap();
+        assert_eq!(total(actions().filter("score", Op::Gte, 0)), 0);
+    }
+
+    #[test]
+    fn indexes_can_be_changed_as_json() {
+        let db = crm();
+        let changes: Vec<SchemaChange> = serde_json::from_value(json!([
+            {"op": "set_indexed", "table": "clients", "field": "name", "indexed": true},
+            {"op": "set_unique", "table": "clients", "field": "mail", "unique": true},
+            {"op": "add_field", "table": "clients", "field":
+                {"name": "code", "type": "text", "required": false, "unique": true}},
+        ]))
+        .unwrap();
+        db.migrate(&changes).unwrap();
+        let tables = db.describe().unwrap();
+        let clients = tables.iter().find(|table| table.name == "clients").unwrap();
+        let flags: Vec<_> = clients
+            .fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.indexed, field.unique))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("name", true, false),
+                ("mail", true, true),
+                ("vip", false, false),
+                ("status", false, false),
+                ("company", true, false),
+                ("code", true, true),
+            ]
+        );
     }
 
     #[test]

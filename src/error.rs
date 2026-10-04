@@ -191,6 +191,61 @@ pub enum DbError {
     },
 
     #[error(
+        "`{field}` must be unique on `{table}`, and `{table}` id {id} already holds {value}. Update that document instead of adding another one, or use a different value."
+    )]
+    DuplicateValue {
+        table: String,
+        field: String,
+        value: String,
+        id: i64,
+    },
+
+    #[error(
+        "cannot make `{field}` unique on `{table}`: {count} documents hold {value}, for example ids {first_id} and {second_id}. Change or delete all but one of them first; nothing was changed."
+    )]
+    DuplicatesExist {
+        table: String,
+        field: String,
+        value: String,
+        count: i64,
+        first_id: i64,
+        second_id: i64,
+    },
+
+    #[error(
+        "cannot run this query: `{table}` holds {count} documents, and a table with more than {limit} is only searched through an index. {unserved}. Indexed fields: {}. Add a filter with eq, gt, gte, lt or lte on one of them{}.",
+        list(.indexed),
+        index_advice(.table, .could_index.as_deref())
+    )]
+    QueryNeedsIndex {
+        table: String,
+        count: i64,
+        limit: i64,
+        /// The filter or sort that no index can answer, as a sentence.
+        unserved: String,
+        indexed: Vec<String>,
+        /// The field whose index would let the query run as it is.
+        could_index: Option<String>,
+    },
+
+    #[error(
+        "table `{table}` cannot have more than {max} indexed fields, because every index slows down each write. It would have these: {}. Ref and unique fields are always indexed. Stop indexing a field that no query filters or sorts by, using the schema change {{\"op\": \"set_indexed\", \"table\": \"{table}\", \"field\": \"<field>\", \"indexed\": false}}.",
+        list(.indexed)
+    )]
+    TooManyIndexes {
+        table: String,
+        max: usize,
+        indexed: Vec<String>,
+    },
+
+    #[error("`{field}` on `{table}` has to stay indexed because {reason}.")]
+    IndexRequired {
+        table: String,
+        field: String,
+        reason: &'static str,
+    },
+
+    #[error(
         "a batch takes at most {max} writes, and this one has {size}. Split it into batches of {max} or fewer and send them one after another."
     )]
     BatchTooLarge { size: usize, max: usize },
@@ -269,6 +324,11 @@ impl DbError {
             Self::InvalidTimestamp { .. } => "invalid_timestamp",
             Self::MissingApiKey => "missing_api_key",
             Self::StepFailed { source, .. } => source.code(),
+            Self::DuplicateValue { .. } => "duplicate_value",
+            Self::DuplicatesExist { .. } => "duplicates_exist",
+            Self::QueryNeedsIndex { .. } => "query_needs_index",
+            Self::TooManyIndexes { .. } => "too_many_indexes",
+            Self::IndexRequired { .. } => "index_required",
             Self::BatchTooLarge { .. } => "batch_too_large",
             Self::ChangesTrimmed { .. } => "changes_trimmed",
             Self::Jev(_) => "model_unavailable",
@@ -294,6 +354,14 @@ impl DbError {
 
 fn hint(suggestion: Option<&str>) -> String {
     suggestion.map_or_else(String::new, |name| format!(" Did you mean `{name}`?"))
+}
+
+fn index_advice(table: &str, field: Option<&str>) -> String {
+    field.map_or_else(String::new, |field| {
+        format!(
+            ", or index `{field}` first with the schema change {{\"op\": \"set_indexed\", \"table\": \"{table}\", \"field\": \"{field}\", \"indexed\": true}}"
+        )
+    })
 }
 
 fn list(items: &[String]) -> String {
