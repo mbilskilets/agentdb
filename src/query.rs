@@ -222,17 +222,22 @@ impl Query {
                 )
             }
         };
-        let mut indexed: Vec<String> = INDEXED_SYSTEM_FIELDS.map(str::to_owned).to_vec();
-        indexed.extend(def.indexed_fields());
         DbError::QueryNeedsIndex {
             table: def.name.clone(),
             count: table_size,
             limit: MAX_SCAN_DOCS,
             unserved,
-            indexed,
+            indexed: fields_with_index(def),
             could_index,
         }
     }
+}
+
+/// Every field of `def` that a filter or sort can reach through an index.
+pub(crate) fn fields_with_index(def: &TableDef) -> Vec<String> {
+    let mut indexed: Vec<String> = INDEXED_SYSTEM_FIELDS.map(str::to_owned).to_vec();
+    indexed.extend(def.indexed_fields());
+    indexed
 }
 
 #[derive(Debug)]

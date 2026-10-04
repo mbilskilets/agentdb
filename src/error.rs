@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 
 use crate::db::RETAINED_CHANGES;
@@ -213,7 +215,7 @@ pub enum DbError {
     },
 
     #[error(
-        "cannot run this query: `{table}` holds {count} documents, and a table with more than {limit} is only searched through an index. {unserved}. Indexed fields: {}. Add a filter with eq, gt, gte, lt or lte on one of them{}.",
+        "cannot run this query: `{table}` holds {count} documents, and a table with more than {limit} is only searched through an index. {unserved}. Indexed fields: {}. Add a filter on one of them that leaves few documents to read (an `eq`, or a narrow `gt`, `gte`, `lt` or `lte` range){}.",
         list(.indexed),
         index_advice(.table, .could_index.as_deref())
     )]
@@ -226,6 +228,17 @@ pub enum DbError {
         indexed: Vec<String>,
         /// The field whose index would let the query run as it is.
         could_index: Option<String>,
+    },
+
+    #[error(
+        "this query was stopped after {budget:?}, the longest one read may run: it had to read too many of the {count} documents in `{table}`. Fast on a table this size: an `eq` filter on an indexed field that matches few documents, a narrow `gt`, `gte`, `lt` or `lte` range on an indexed field, a small `offset`. Slow: a range that covers most of the table, `contains` or a sort over many documents, a large `offset`. Indexed fields: {}. Narrow the query and send it again.",
+        list(.indexed)
+    )]
+    QueryTooSlow {
+        table: String,
+        count: i64,
+        budget: Duration,
+        indexed: Vec<String>,
     },
 
     #[error(
@@ -327,6 +340,7 @@ impl DbError {
             Self::DuplicateValue { .. } => "duplicate_value",
             Self::DuplicatesExist { .. } => "duplicates_exist",
             Self::QueryNeedsIndex { .. } => "query_needs_index",
+            Self::QueryTooSlow { .. } => "query_too_slow",
             Self::TooManyIndexes { .. } => "too_many_indexes",
             Self::IndexRequired { .. } => "index_required",
             Self::BatchTooLarge { .. } => "batch_too_large",

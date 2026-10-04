@@ -524,7 +524,7 @@ mod tests {
     }
 
     const TOO_LARGE: &str = "cannot run this query: `events` holds 1001 documents, and a table with more than 1000 is only searched through an index.";
-    const INDEXED: &str = "Indexed fields: id, created_at, updated_at, kind, score. Add a filter with eq, gt, gte, lt or lte on one of them";
+    const INDEXED: &str = "Indexed fields: id, created_at, updated_at, kind, score. Add a filter on one of them that leaves few documents to read (an `eq`, or a narrow `gt`, `gte`, `lt` or `lte` range)";
     const INDEX_WEIGHT: &str = r#", or index `weight` first with the schema change {"op": "set_indexed", "table": "events", "field": "weight", "indexed": true}."#;
 
     #[test]
